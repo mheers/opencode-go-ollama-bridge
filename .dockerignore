@@ -1,0 +1,6 @@
+bin/
+.git/
+*.md
+.env
+.env.*
+coverage.*
