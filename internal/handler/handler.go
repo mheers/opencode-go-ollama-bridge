@@ -1,15 +1,35 @@
 package handler
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/mheers/opencode-go-ollama-bridge/internal/adapter"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
+)
+
+var (
+	miniMaxWrapperRE = regexp.MustCompile(`\]<\]minimax\[>\[`)
+	thinkBlockRE     = regexp.MustCompile(`(?is)<think>.*?</think>`)
+	toolCallInnerRE  = regexp.MustCompile(`(?is)<tool_call\b[^>]*>(.*?)</tool_call>`)
+	toolCallBlockRE  = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*?</tool_call>`)
+	functionTagRE    = regexp.MustCompile(`(?is)<function\s+([a-zA-Z_][a-zA-Z0-9_-]*)>(.*?)</function>`)
+	parameterTagRE   = regexp.MustCompile(`(?is)<parameter=([a-zA-Z_][a-zA-Z0-9_-]*)>(.*?)</parameter>`)
+	invokeTagRE      = regexp.MustCompile(`(?is)<invoke\s+name=\"([a-zA-Z_][a-zA-Z0-9_-]*)\">(.*?)</invoke>`)
+	commandTagRE     = regexp.MustCompile(`(?is)<command>(.*?)</command>`)
+	thinkTailRE      = regexp.MustCompile(`(?is)<think>.*$`)
+	toolCallTailRE   = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*$`)
+	bracketCallRE    = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
+	bareCallNameRE   = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
+	multiBlankRE     = regexp.MustCompile(`\n{3,}`)
 )
 
 type Handler struct {
@@ -26,6 +46,20 @@ func (h *Handler) logf(format string, args ...interface{}) {
 	if h.debug {
 		log.Printf(format, args...)
 	}
+}
+
+func (h *Handler) logBody(tag string, body []byte) {
+	if !h.debug {
+		return
+	}
+
+	const maxLogBytes = 20000
+	if len(body) <= maxLogBytes {
+		h.logf("%s %s", tag, string(body))
+		return
+	}
+
+	h.logf("%s %s ... [truncated %d bytes]", tag, string(body[:maxLogBytes]), len(body)-maxLogBytes)
 }
 
 func (h *Handler) Health() http.HandlerFunc {
@@ -130,12 +164,12 @@ func (h *Handler) Show() http.HandlerFunc {
 				"quantization_level": "F16",
 			},
 			"model_info": map[string]interface{}{
-				"general.architecture":          arch,
-				"general.quantization_version":   2,
-				"general.file_type":              1,
-				"general.context_length":         ctxLen,
-				arch + ".context_length":         ctxLen,
-				arch + ".block_count":            32,
+				"general.architecture":         arch,
+				"general.quantization_version": 2,
+				"general.file_type":            1,
+				"general.context_length":       ctxLen,
+				arch + ".context_length":       ctxLen,
+				arch + ".block_count":          32,
 			},
 			"capabilities": []string{"completion", "tools"},
 		}
@@ -231,24 +265,15 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 		var upstreamErr error
 
 		if adapter.IsMiniMaxModel(modelID) {
-			h.logf("[V1/CHAT] routing to anthropic backend for %s", modelID)
-			anthReq := map[string]interface{}{
-				"model":      modelID,
-				"max_tokens": 65536,
-				"messages":   json.RawMessage(req.Messages),
-				"stream":     req.Stream,
+			h.logf("[V1/CHAT] routing to openai backend (repaired minimax path) for %s", modelID)
+			var proxyReq map[string]interface{}
+			if err := json.Unmarshal(body, &proxyReq); err != nil {
+				http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+				return
 			}
-			if req.Temperature != nil {
-				anthReq["temperature"] = *req.Temperature
-			}
-			if req.Tools != nil {
-				var tools []adapter.AnthropicTool
-				h.convertOAToolsToAnthropic(req.Tools, &tools)
-				if len(tools) > 0 {
-					anthReq["tools"] = tools
-				}
-			}
-			upstreamResp, upstreamErr = h.client.Messages(anthReq)
+			proxyReq["model"] = modelID
+			proxyReq["stream"] = false
+			upstreamResp, upstreamErr = h.client.ChatCompletions(proxyReq)
 		} else {
 			h.logf("[V1/CHAT] routing to openai backend for %s", modelID)
 			var proxyReq map[string]interface{}
@@ -284,6 +309,34 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 			return
 		}
 
+		if adapter.IsMiniMaxModel(modelID) {
+			rawBody, repairedBody, err := repairTaggedV1Body(upstreamResp.Body)
+			if err != nil {
+				h.logf("[V1/CHAT] minimax repair decode error: %v", err)
+				http.Error(w, `{"error":"failed to decode upstream response"}`, http.StatusBadGateway)
+				return
+			}
+
+			h.logBody("[V1/CHAT] upstream raw body:", rawBody)
+			h.logBody("[V1/CHAT] fixed body:", repairedBody)
+
+			if req.Stream {
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set("Cache-Control", "no-cache")
+				w.Header().Set("Connection", "keep-alive")
+				w.WriteHeader(http.StatusOK)
+				if err := writeOpenAIStreamFromResponse(w, repairedBody, modelID); err != nil {
+					h.logf("[V1/CHAT] minimax stream write error: %v", err)
+				}
+				return
+			}
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write(repairedBody)
+			return
+		}
+
 		copyHeader := upstreamResp.Header.Get("Content-Type")
 		if copyHeader != "" {
 			w.Header().Set("Content-Type", copyHeader)
@@ -298,30 +351,807 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 				http.Error(w, `{"error":"streaming not supported"}`, http.StatusInternalServerError)
 				return
 			}
-			w.WriteHeader(http.StatusOK)
-			buf := make([]byte, 4096)
-			for {
-				n, err := upstreamResp.Body.Read(buf)
-				if n > 0 {
-					if _, werr := w.Write(buf[:n]); werr != nil {
-						h.logf("[V1/CHAT] write error: %v", werr)
-						return
-					}
-					flusher.Flush()
-				}
-				if err != nil {
-					if err != io.EOF {
-						h.logf("[V1/CHAT] stream read error: %v", err)
-					}
-					break
-				}
+			// Buffer + rewrite stream to make tag/tool-call normalization robust across split chunks.
+			rawSSE, err := io.ReadAll(upstreamResp.Body)
+			if err != nil {
+				h.logf("[V1/CHAT] stream read error: %v", err)
+				http.Error(w, `{"error":"failed to read upstream stream"}`, http.StatusBadGateway)
+				return
 			}
+
+			h.logBody("[V1/CHAT] upstream raw stream body:", rawSSE)
+			w.WriteHeader(http.StatusOK)
+
+			repairedBody, err := rewriteBufferedOpenAISSE(bytes.NewReader(rawSSE), w, flusher, modelID)
+			if err != nil {
+				h.logf("[V1/CHAT] stream sanitize error: %v", err)
+				return
+			}
+
+			h.logBody("[V1/CHAT] fixed stream body:", repairedBody)
 			return
 		}
 
+		rawBody, repairedBody, err := repairTaggedV1Body(upstreamResp.Body)
+		if err != nil {
+			h.logf("[V1/CHAT] repair decode error: %v", err)
+			http.Error(w, `{"error":"failed to decode upstream response"}`, http.StatusBadGateway)
+			return
+		}
+
+		h.logBody("[V1/CHAT] upstream raw body:", rawBody)
+		h.logBody("[V1/CHAT] fixed body:", repairedBody)
+
 		w.WriteHeader(upstreamResp.StatusCode)
-		io.Copy(w, upstreamResp.Body)
+		w.Write(repairedBody)
 	}
+}
+
+func repairTaggedV1Body(r io.Reader) ([]byte, []byte, error) {
+	body, err := io.ReadAll(r)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body, body, nil
+	}
+
+	choices, _ := payload["choices"].([]interface{})
+	for _, ch := range choices {
+		choice, ok := ch.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if msg, ok := choice["message"].(map[string]interface{}); ok {
+			if content, ok := msg["content"].(string); ok {
+				clean, toolCalls := parseTaggedAssistantContent(content)
+				msg["content"] = clean
+				if len(toolCalls) > 0 {
+					msg["tool_calls"] = toolCalls
+					if _, hasFinishReason := choice["finish_reason"]; !hasFinishReason {
+						choice["finish_reason"] = "tool_calls"
+					} else if fr, ok := choice["finish_reason"].(string); ok && (fr == "" || fr == "stop") {
+						choice["finish_reason"] = "tool_calls"
+					}
+				}
+			}
+		}
+		if delta, ok := choice["delta"].(map[string]interface{}); ok {
+			if content, ok := delta["content"].(string); ok {
+				clean, toolCalls := parseTaggedAssistantContent(content)
+				delta["content"] = clean
+				if len(toolCalls) > 0 {
+					delta["tool_calls"] = toolCallsToDelta(toolCalls)
+					if _, hasFinishReason := choice["finish_reason"]; !hasFinishReason {
+						choice["finish_reason"] = "tool_calls"
+					} else if fr, ok := choice["finish_reason"].(string); ok && (fr == "" || fr == "stop") {
+						choice["finish_reason"] = "tool_calls"
+					}
+				}
+			}
+		}
+	}
+
+	repaired, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return body, repaired, nil
+}
+
+func sanitizeTaggedText(s string) string {
+	s = miniMaxWrapperRE.ReplaceAllString(s, "")
+	s = thinkBlockRE.ReplaceAllString(s, "")
+	s = toolCallBlockRE.ReplaceAllString(s, "")
+	s = thinkTailRE.ReplaceAllString(s, "")
+	s = toolCallTailRE.ReplaceAllString(s, "")
+	s = strings.TrimSpace(s)
+	s = multiBlankRE.ReplaceAllString(s, "\n\n")
+	return s
+}
+
+func parseTaggedAssistantContent(content string) (string, []map[string]interface{}) {
+	clean := sanitizeTaggedText(content)
+	toolCalls := extractToolCalls(content)
+	return clean, toolCalls
+}
+
+func extractToolCalls(raw string) []map[string]interface{} {
+	matches := toolCallInnerRE.FindAllStringSubmatch(raw, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+
+	out := make([]map[string]interface{}, 0)
+	callIdx := 0
+
+	for _, m := range matches {
+		if len(m) < 2 {
+			continue
+		}
+		inner := strings.TrimSpace(miniMaxWrapperRE.ReplaceAllString(m[1], ""))
+		if inner == "" {
+			continue
+		}
+
+		dec := json.NewDecoder(strings.NewReader(inner))
+		parsedAny := false
+		for {
+			var obj map[string]interface{}
+			if err := dec.Decode(&obj); err != nil {
+				break
+			}
+			parsedAny = true
+
+			name := ""
+			if n, ok := obj["name"].(string); ok {
+				name = n
+			} else if fn, ok := obj["function"].(map[string]interface{}); ok {
+				name, _ = fn["name"].(string)
+			}
+			if name == "" {
+				continue
+			}
+
+			argsJSON := "{}"
+			if p, ok := obj["parameters"]; ok {
+				if b, err := json.Marshal(p); err == nil {
+					argsJSON = string(b)
+				}
+			} else if a, ok := obj["arguments"]; ok {
+				switch v := a.(type) {
+				case string:
+					if json.Valid([]byte(v)) {
+						argsJSON = v
+					} else {
+						if b, err := json.Marshal(v); err == nil {
+							argsJSON = string(b)
+						}
+					}
+				default:
+					if b, err := json.Marshal(v); err == nil {
+						argsJSON = string(b)
+					}
+				}
+			}
+
+			id := ""
+			if rawID, ok := obj["id"].(string); ok && rawID != "" {
+				id = rawID
+			} else {
+				id = fmt.Sprintf("call_%d", callIdx)
+			}
+
+			out = append(out, map[string]interface{}{
+				"id":   id,
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+
+		if parsedAny {
+			continue
+		}
+
+		for _, im := range invokeTagRE.FindAllStringSubmatch(inner, -1) {
+			if len(im) < 3 {
+				continue
+			}
+			name := strings.TrimSpace(im[1])
+			if !bareCallNameRE.MatchString(strings.ToLower(name)) {
+				continue
+			}
+
+			params := map[string]string{}
+			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
+				params["command"] = strings.TrimSpace(cm[1])
+			}
+			for _, pm := range parameterTagRE.FindAllStringSubmatch(im[2], -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				k := strings.TrimSpace(pm[1])
+				v := strings.TrimSpace(pm[2])
+				if k == "" {
+					continue
+				}
+				params[k] = v
+			}
+
+			argsJSON := "{}"
+			if b, err := json.Marshal(params); err == nil {
+				argsJSON = string(b)
+			}
+
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+
+		for _, b := range bracketCallRE.FindAllStringSubmatch(inner, -1) {
+			if len(b) < 3 {
+				continue
+			}
+			name := strings.TrimSpace(b[1])
+			argsJSON := strings.TrimSpace(b[2])
+			if !bareCallNameRE.MatchString(strings.ToLower(name)) {
+				continue
+			}
+			if !json.Valid([]byte(argsJSON)) {
+				continue
+			}
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+
+		for _, fm := range functionTagRE.FindAllStringSubmatch(inner, -1) {
+			if len(fm) < 3 {
+				continue
+			}
+			name := strings.TrimSpace(fm[1])
+			if !bareCallNameRE.MatchString(strings.ToLower(name)) {
+				continue
+			}
+			params := map[string]string{}
+			for _, pm := range parameterTagRE.FindAllStringSubmatch(fm[2], -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				k := strings.TrimSpace(pm[1])
+				v := strings.TrimSpace(pm[2])
+				if k == "" {
+					continue
+				}
+				params[k] = v
+			}
+			argsJSON := "{}"
+			if b, err := json.Marshal(params); err == nil {
+				argsJSON = string(b)
+			}
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+
+		// Last fallback: plain tool names inside the block (no args available).
+		// Restrict to function-like names (must contain underscore) to avoid false calls like cd/git/log.
+		for _, tok := range strings.Fields(inner) {
+			t := strings.TrimSpace(strings.Trim(tok, "[](),"))
+			if !bareCallNameRE.MatchString(strings.ToLower(t)) {
+				continue
+			}
+			if !strings.Contains(t, "_") {
+				continue
+			}
+			if t == "name" || t == "parameters" || t == "arguments" || t == "https" || t == "http" {
+				continue
+			}
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      t,
+					"arguments": "{}",
+				},
+			})
+			callIdx++
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func toolCallsToDelta(toolCalls []map[string]interface{}) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(toolCalls))
+	for i, tc := range toolCalls {
+		entry := map[string]interface{}{
+			"index": i,
+		}
+		if id, ok := tc["id"].(string); ok {
+			entry["id"] = id
+		}
+		if typ, ok := tc["type"].(string); ok {
+			entry["type"] = typ
+		}
+		if fn, ok := tc["function"].(map[string]interface{}); ok {
+			entry["function"] = fn
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func proxySanitizedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.Flusher) error {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	for scanner.Scan() {
+		line := scanner.Text()
+
+		if strings.HasPrefix(line, "data: ") {
+			data := strings.TrimPrefix(line, "data: ")
+			if data != "[DONE]" {
+				var payload map[string]interface{}
+				if err := json.Unmarshal([]byte(data), &payload); err == nil {
+					choices, _ := payload["choices"].([]interface{})
+					for _, ch := range choices {
+						choice, ok := ch.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						if msg, ok := choice["message"].(map[string]interface{}); ok {
+							if content, ok := msg["content"].(string); ok {
+								clean, toolCalls := parseTaggedAssistantContent(content)
+								msg["content"] = clean
+								if len(toolCalls) > 0 {
+									msg["tool_calls"] = toolCalls
+									if fr, ok := choice["finish_reason"].(string); !ok || fr == "" || fr == "stop" {
+										choice["finish_reason"] = "tool_calls"
+									}
+								}
+							}
+						}
+						if delta, ok := choice["delta"].(map[string]interface{}); ok {
+							if content, ok := delta["content"].(string); ok {
+								clean, toolCalls := parseTaggedAssistantContent(content)
+								delta["content"] = clean
+								if len(toolCalls) > 0 {
+									delta["tool_calls"] = toolCallsToDelta(toolCalls)
+									if fr, ok := choice["finish_reason"].(string); !ok || fr == "" || fr == "stop" {
+										choice["finish_reason"] = "tool_calls"
+									}
+								}
+							}
+						}
+					}
+
+					if normalized, err := json.Marshal(payload); err == nil {
+						line = "data: " + string(normalized)
+					}
+				}
+			}
+		}
+
+		if _, err := io.WriteString(writer, line+"\n"); err != nil {
+			return err
+		}
+		flusher.Flush()
+	}
+
+	return scanner.Err()
+}
+
+func rewriteBufferedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.Flusher, fallbackModel string) ([]byte, error) {
+	type toolCallState struct {
+		id      string
+		typ     string
+		name    string
+		argsBuf strings.Builder
+	}
+
+	type choiceState struct {
+		index        int
+		content      strings.Builder
+		toolCalls    map[int]*toolCallState
+		finishReason string
+	}
+
+	states := map[int]*choiceState{}
+	order := make([]int, 0)
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	respID := ""
+	model := fallbackModel
+	var created int64
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(data), &payload); err != nil {
+			continue
+		}
+
+		if respID == "" {
+			if id, ok := payload["id"].(string); ok {
+				respID = id
+			}
+		}
+		if model == "" {
+			if m, ok := payload["model"].(string); ok {
+				model = m
+			}
+		}
+		if created == 0 {
+			switch v := payload["created"].(type) {
+			case float64:
+				created = int64(v)
+			case int64:
+				created = v
+			}
+		}
+
+		choices, _ := payload["choices"].([]interface{})
+		for _, c := range choices {
+			choice, ok := c.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			idx := 0
+			switch v := choice["index"].(type) {
+			case float64:
+				idx = int(v)
+			case int:
+				idx = v
+			}
+
+			st, ok := states[idx]
+			if !ok {
+				st = &choiceState{index: idx, toolCalls: make(map[int]*toolCallState)}
+				states[idx] = st
+				order = append(order, idx)
+			}
+
+			if fr, ok := choice["finish_reason"].(string); ok && fr != "" {
+				st.finishReason = fr
+			}
+
+			if delta, ok := choice["delta"].(map[string]interface{}); ok {
+				if content, ok := delta["content"].(string); ok {
+					st.content.WriteString(content)
+				}
+				if dToolCalls, ok := delta["tool_calls"].([]interface{}); ok {
+					for _, dtc := range dToolCalls {
+						tcm, ok := dtc.(map[string]interface{})
+						if !ok {
+							continue
+						}
+
+						tcIndex := 0
+						switch v := tcm["index"].(type) {
+						case float64:
+							tcIndex = int(v)
+						case int:
+							tcIndex = v
+						}
+
+						tcs, ok := st.toolCalls[tcIndex]
+						if !ok {
+							tcs = &toolCallState{}
+							st.toolCalls[tcIndex] = tcs
+						}
+
+						if id, ok := tcm["id"].(string); ok && id != "" {
+							tcs.id = id
+						}
+						if typ, ok := tcm["type"].(string); ok && typ != "" {
+							tcs.typ = typ
+						}
+						if fn, ok := tcm["function"].(map[string]interface{}); ok {
+							if name, ok := fn["name"].(string); ok && name != "" {
+								tcs.name = name
+							}
+							if args, ok := fn["arguments"].(string); ok {
+								tcs.argsBuf.WriteString(args)
+							}
+						}
+					}
+				}
+			}
+			if msg, ok := choice["message"].(map[string]interface{}); ok {
+				if content, ok := msg["content"].(string); ok {
+					st.content.WriteString(content)
+				}
+				if mToolCalls, ok := msg["tool_calls"].([]interface{}); ok {
+					for tcIdx, mtc := range mToolCalls {
+						tcm, ok := mtc.(map[string]interface{})
+						if !ok {
+							continue
+						}
+						tcs, ok := st.toolCalls[tcIdx]
+						if !ok {
+							tcs = &toolCallState{}
+							st.toolCalls[tcIdx] = tcs
+						}
+						if id, ok := tcm["id"].(string); ok && id != "" {
+							tcs.id = id
+						}
+						if typ, ok := tcm["type"].(string); ok && typ != "" {
+							tcs.typ = typ
+						}
+						if fn, ok := tcm["function"].(map[string]interface{}); ok {
+							if name, ok := fn["name"].(string); ok && name != "" {
+								tcs.name = name
+							}
+							if args, ok := fn["arguments"].(string); ok {
+								tcs.argsBuf.WriteString(args)
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, err
+	}
+
+	if respID == "" {
+		respID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+
+	resp := adapter.OpenAIResponse{
+		ID:      respID,
+		Object:  "chat.completion",
+		Created: created,
+		Model:   model,
+		Choices: make([]adapter.OpenAIChoice, 0, len(order)),
+	}
+
+	for _, idx := range order {
+		st := states[idx]
+		clean, tcs := parseTaggedAssistantContent(st.content.String())
+
+		if len(st.toolCalls) > 0 {
+			fromUpstream := make([]map[string]interface{}, 0, len(st.toolCalls))
+			for i := 0; i < len(st.toolCalls); i++ {
+				tc, ok := st.toolCalls[i]
+				if !ok {
+					continue
+				}
+				if tc.name == "" {
+					continue
+				}
+				typ := tc.typ
+				if typ == "" {
+					typ = "function"
+				}
+				id := tc.id
+				if id == "" {
+					id = fmt.Sprintf("call_%d", i)
+				}
+				args := tc.argsBuf.String()
+				if args == "" {
+					args = "{}"
+				}
+				if !json.Valid([]byte(args)) {
+					args = "{}"
+				}
+				fromUpstream = append(fromUpstream, map[string]interface{}{
+					"id":   id,
+					"type": typ,
+					"function": map[string]interface{}{
+						"name":      tc.name,
+						"arguments": args,
+					},
+				})
+			}
+			if len(fromUpstream) > 0 {
+				tcs = fromUpstream
+			}
+		}
+
+		choice := adapter.OpenAIChoice{Index: idx}
+		choice.Message = &adapter.OpenAIMessageResp{Role: "assistant", Content: clean}
+		if len(tcs) > 0 {
+			converted := make([]adapter.OpenAIToolCall, 0, len(tcs))
+			for _, tc := range tcs {
+				fn, _ := tc["function"].(map[string]interface{})
+				name, _ := fn["name"].(string)
+				args, _ := fn["arguments"].(string)
+				id, _ := tc["id"].(string)
+				typ, _ := tc["type"].(string)
+				if typ == "" {
+					typ = "function"
+				}
+				converted = append(converted, adapter.OpenAIToolCall{
+					ID:   id,
+					Type: typ,
+					Function: adapter.OpenAIToolFunction{
+						Name:      name,
+						Arguments: args,
+					},
+				})
+			}
+			choice.Message.ToolCalls = converted
+		}
+
+		fr := st.finishReason
+		if len(choice.Message.ToolCalls) > 0 {
+			if fr == "" || fr == "stop" {
+				fr = "tool_calls"
+			}
+		} else if fr == "" {
+			fr = "stop"
+		}
+		choice.FinishReason = &fr
+		resp.Choices = append(resp.Choices, choice)
+	}
+
+	body, err := json.Marshal(resp)
+	if err != nil {
+		return nil, err
+	}
+	if err := writeOpenAIStreamFromResponse(writer, body, fallbackModel); err != nil {
+		return nil, err
+	}
+	flusher.Flush()
+	return body, nil
+}
+
+func writeOpenAIStreamFromResponse(w io.Writer, repairedBody []byte, fallbackModel string) error {
+	var resp adapter.OpenAIResponse
+	if err := json.Unmarshal(repairedBody, &resp); err != nil {
+		return err
+	}
+
+	id := resp.ID
+	if id == "" {
+		id = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	}
+	created := resp.Created
+	if created == 0 {
+		created = time.Now().Unix()
+	}
+	model := resp.Model
+	if model == "" {
+		model = fallbackModel
+	}
+
+	for i, choice := range resp.Choices {
+		content := ""
+		var toolCalls []adapter.OpenAIToolCall
+		if choice.Message != nil {
+			content = choice.Message.Content
+			toolCalls = choice.Message.ToolCalls
+		}
+		if content == "" && len(toolCalls) == 0 {
+			continue
+		}
+
+		if content != "" {
+			chunk := map[string]interface{}{
+				"id":      id,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index": i,
+						"delta": map[string]interface{}{
+							"role":    "assistant",
+							"content": content,
+						},
+						"finish_reason": nil,
+					},
+				},
+			}
+
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return err
+			}
+		}
+
+		if len(toolCalls) > 0 {
+			deltaToolCalls := make([]map[string]interface{}, 0, len(toolCalls))
+			for idx, tc := range toolCalls {
+				deltaToolCalls = append(deltaToolCalls, map[string]interface{}{
+					"index": idx,
+					"id":    tc.ID,
+					"type":  tc.Type,
+					"function": map[string]interface{}{
+						"name":      tc.Function.Name,
+						"arguments": tc.Function.Arguments,
+					},
+				})
+			}
+
+			chunk := map[string]interface{}{
+				"id":      id,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index": i,
+						"delta": map[string]interface{}{
+							"role":       "assistant",
+							"tool_calls": deltaToolCalls,
+						},
+						"finish_reason": nil,
+					},
+				},
+			}
+
+			data, err := json.Marshal(chunk)
+			if err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return err
+			}
+		}
+	}
+
+	finishReason := "stop"
+	if len(resp.Choices) > 0 {
+		if resp.Choices[0].FinishReason != nil && *resp.Choices[0].FinishReason != "" {
+			finishReason = *resp.Choices[0].FinishReason
+		} else if resp.Choices[0].Message != nil && len(resp.Choices[0].Message.ToolCalls) > 0 {
+			finishReason = "tool_calls"
+		}
+	}
+
+	finalChunk := map[string]interface{}{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []map[string]interface{}{
+			{
+				"index":         0,
+				"delta":         map[string]interface{}{},
+				"finish_reason": finishReason,
+			},
+		},
+	}
+	data, err := json.Marshal(finalChunk)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		return err
+	}
+
+	_, err = io.WriteString(w, "data: [DONE]\n\n")
+	return err
 }
 
 func (h *Handler) convertOAToolsToAnthropic(toolsRaw json.RawMessage, out *[]adapter.AnthropicTool) {
@@ -700,5 +1530,3 @@ func boolPtr(b *bool) bool {
 	}
 	return *b
 }
-
-

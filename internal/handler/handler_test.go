@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -264,5 +265,411 @@ func TestShowEndpoint_GetNotAllowed(t *testing.T) {
 
 	if w.Code != http.StatusMethodNotAllowed {
 		t.Errorf("expected 405, got %d", w.Code)
+	}
+}
+
+func TestSanitizeTaggedText(t *testing.T) {
+	in := `<think>internal notes</think>
+Optimized tool selection
+
+]<]minimax[>[<tool_call> - read_file </tool_call>
+
+Visible answer`
+
+	out := sanitizeTaggedText(in)
+
+	if strings.Contains(out, "<think>") {
+		t.Fatalf("think block should be removed: %q", out)
+	}
+	if strings.Contains(out, "<tool_call>") {
+		t.Fatalf("tool_call block should be removed: %q", out)
+	}
+	if strings.Contains(out, "]<]minimax[>[") {
+		t.Fatalf("minimax wrapper should be removed: %q", out)
+	}
+	if !strings.Contains(out, "Visible answer") {
+		t.Fatalf("expected remaining visible answer, got: %q", out)
+	}
+}
+
+func TestParseTaggedAssistantContent_ExtractsToolCalls(t *testing.T) {
+	in := `<think>analysis</think>I'll explore now.
+<tool_call>{"name":"read_file","parameters":{"filePath":"/tmp/demo/README.md"}} {"name":"read_file","parameters":{"filePath":"/tmp/demo/go.mod"}}</tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+
+	if strings.Contains(clean, "<think>") || strings.Contains(clean, "<tool_call>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if !strings.Contains(clean, "I'll explore now.") {
+		t.Fatalf("expected visible text to remain, got: %q", clean)
+	}
+	if len(toolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("unexpected tool name: %+v", fn)
+	}
+}
+
+func TestParseTaggedAssistantContent_ExtractsMalformedToolCalls(t *testing.T) {
+	in := `<think>thinking</think>I'll explore now.
+<tool_call> read_file read_file [read_file {"filePath":"/tmp/demo/go.mod"}] [read_file {"filePath":"/tmp/demo/main.go"}] </tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+
+	if strings.Contains(clean, "<think>") || strings.Contains(clean, "<tool_call>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if len(toolCalls) < 2 {
+		t.Fatalf("expected at least 2 tool calls from malformed block, got %d", len(toolCalls))
+	}
+}
+
+func TestParseTaggedAssistantContent_FunctionTagStyle(t *testing.T) {
+	in := `<tool_call>
+<function run_in_terminal>
+<parameter=command>
+cd /tmp/demo && git log --oneline
+</parameter>
+</function>
+</tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["command"] != "cd /tmp/demo && git log --oneline" {
+		t.Fatalf("unexpected command argument: %q", parsed["command"])
+	}
+}
+
+func TestParseTaggedAssistantContent_MiniMaxInvokeStyle(t *testing.T) {
+	in := `]<]minimax[>[<tool_call>
+]<]minimax[>[<invoke name="run_in_terminal">]<]minimax[>[<command>cd /tmp/demo && git log --oneline</command>]<]minimax[>[</invoke>
+]<]minimax[>[</tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["command"] != "cd /tmp/demo && git log --oneline" {
+		t.Fatalf("unexpected command argument: %q", parsed["command"])
+	}
+}
+
+func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if ct := r.Header.Get("Authorization"); ct != "Bearer test-key" {
+			t.Fatalf("unexpected auth header: %s", ct)
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if stream && !strings.Contains(string(body), `"stream":true`) {
+			t.Fatalf("expected stream=true to be forwarded for non-minimax, body=%s", string(body))
+		}
+
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(response))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	return New(c, "0.24.0", false)
+}
+
+func newMiniMaxV1Handler(t *testing.T, response string) *Handler {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if ct := r.Header.Get("Authorization"); ct != "Bearer test-key" {
+			t.Fatalf("unexpected auth header: %s", ct)
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"stream":false`) {
+			t.Fatalf("expected bridge to force stream=false for minimax repair path, body=%s", string(body))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(response))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	return New(c, "0.24.0", false)
+}
+
+func TestV1ChatCompletions_MiniMax_RepairsNonStreamingContent(t *testing.T) {
+	upstream := `{
+		"id":"chatcmpl-1",
+		"object":"chat.completion",
+		"created":1,
+		"model":"minimax-m2.5",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"<think>plan</think>Final answer ]<]minimax[>[<tool_call>{\"name\":\"read_file\",\"parameters\":{\"filePath\":\"/tmp/demo/README.md\"}}</tool_call>"
+			},
+			"finish_reason":"stop"
+		}]
+	}`
+
+	h := newMiniMaxV1Handler(t, upstream)
+	body := `{"model":"minimax-m2.5","messages":[{"role":"user","content":"validate repo"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid json: %v", err)
+	}
+	choices, _ := resp["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d", len(choices))
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	msg, _ := choice["message"].(map[string]interface{})
+	content, _ := msg["content"].(string)
+	toolCalls, _ := msg["tool_calls"].([]interface{})
+
+	if strings.Contains(content, "<think>") || strings.Contains(content, "<tool_call>") || strings.Contains(content, "]<]minimax[>[") {
+		t.Fatalf("content still contains unsupported tags: %q", content)
+	}
+	if content != "Final answer" {
+		t.Fatalf("unexpected repaired content: %q", content)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 structured tool_call, got %d", len(toolCalls))
+	}
+	if fr, _ := choice["finish_reason"].(string); fr != "tool_calls" {
+		t.Fatalf("expected finish_reason=tool_calls, got %q", fr)
+	}
+}
+
+func TestV1ChatCompletions_MiniMax_RepairsStreamingContent(t *testing.T) {
+	upstream := `{
+		"id":"chatcmpl-2",
+		"object":"chat.completion",
+		"created":2,
+		"model":"minimax-m2.5",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"<think>plan</think>Answer text ]<]minimax[>[<tool_call>{\"name\":\"run_in_terminal\",\"parameters\":{\"command\":\"go test ./...\"}}</tool_call>"
+			},
+			"finish_reason":"stop"
+		}]
+	}`
+
+	h := newMiniMaxV1Handler(t, upstream)
+	body := `{"model":"minimax-m2.5","messages":[{"role":"user","content":"validate repo"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if !strings.Contains(bodyOut, "data: ") || !strings.Contains(bodyOut, "data: [DONE]") {
+		t.Fatalf("expected SSE output with DONE marker, got: %s", bodyOut)
+	}
+	if strings.Contains(bodyOut, "<think>") || strings.Contains(bodyOut, "<tool_call>") || strings.Contains(bodyOut, "]<]minimax[>[") {
+		t.Fatalf("stream output still contains unsupported tags: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, "Answer text") {
+		t.Fatalf("expected repaired answer in stream output: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"tool_calls"`) {
+		t.Fatalf("expected structured tool_calls in SSE output: %s", bodyOut)
+	}
+}
+
+func TestV1ChatCompletions_OpenAI_RepairsNonStreamingContent(t *testing.T) {
+	upstream := `{
+		"id":"chatcmpl-3",
+		"object":"chat.completion",
+		"created":3,
+		"model":"glm-5.1",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"<think>hidden</think>Clean output ]<]minimax[>[<tool_call>{\"name\":\"read_file\",\"parameters\":{\"filePath\":\"/tmp/demo/go.mod\"}}</tool_call>"
+			},
+			"finish_reason":"stop"
+		}]
+	}`
+
+	h := newOpenAIV1Handler(t, upstream, false)
+	body := `{"model":"glm-5.1","messages":[{"role":"user","content":"hello"}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "<think>") || strings.Contains(w.Body.String(), "<tool_call>") {
+		t.Fatalf("non-stream response still contains unsupported tags: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Clean output") {
+		t.Fatalf("expected sanitized response content: %s", w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"tool_calls"`) {
+		t.Fatalf("expected structured tool_calls in response: %s", w.Body.String())
+	}
+}
+
+func TestV1ChatCompletions_OpenAI_RepairsStreamingContent(t *testing.T) {
+	upstream := "data: {\"id\":\"chatcmpl-4\",\"object\":\"chat.completion.chunk\",\"created\":4,\"model\":\"glm-5.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"<think>plan</think>Hello ]<]minimax[>[<tool_call>{\\\"name\\\":\\\"run\\\",\\\"parameters\\\":{\\\"x\\\":1}}</tool_call>\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n"
+
+	h := newOpenAIV1Handler(t, upstream, true)
+	body := `{"model":"glm-5.1","messages":[{"role":"user","content":"hello"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if strings.Contains(bodyOut, "<think>") || strings.Contains(bodyOut, "<tool_call>") || strings.Contains(bodyOut, "]<]minimax[>[") {
+		t.Fatalf("stream response still contains unsupported tags: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, "Hello") || !strings.Contains(bodyOut, "data: [DONE]") {
+		t.Fatalf("expected sanitized SSE output with DONE marker: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"tool_calls"`) {
+		t.Fatalf("expected structured tool_calls in stream output: %s", bodyOut)
+	}
+}
+
+func TestV1ChatCompletions_OpenAI_StreamWithSplitTagsStillSanitizes(t *testing.T) {
+	upstream := "data: {\"id\":\"chatcmpl-5\",\"object\":\"chat.completion.chunk\",\"created\":5,\"model\":\"glm-5.1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"<think>hidden\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-5\",\"object\":\"chat.completion.chunk\",\"created\":5,\"model\":\"glm-5.1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" text</think>Answer <tool_call> [read_file {\\\"filePath\\\":\\\"/tmp/demo/go.mod\\\"}] </tool_call>\"},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	h := newOpenAIV1Handler(t, upstream, true)
+	body := `{"model":"glm-5.1","messages":[{"role":"user","content":"hello"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if strings.Contains(bodyOut, "<think>") || strings.Contains(bodyOut, "<tool_call>") {
+		t.Fatalf("split-tag stream still contains markup: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, "Answer") || !strings.Contains(bodyOut, `"tool_calls"`) {
+		t.Fatalf("expected sanitized answer and tool_calls in rewritten stream: %s", bodyOut)
+	}
+}
+
+func TestV1ChatCompletions_OpenAI_StreamPreservesNativeToolCalls(t *testing.T) {
+	upstream := "data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":10,\"model\":\"qwen3.7-plus\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_abc\",\"type\":\"function\",\"function\":{\"name\":\"run_in_terminal\",\"arguments\":\"\"}}],\"content\":\"\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":10,\"model\":\"qwen3.7-plus\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"\",\"type\":\"function\",\"function\":{\"arguments\":\"{\\\"command\\\":\\\"git log --oneline\\\"}\"}}],\"content\":\"\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-native\",\"object\":\"chat.completion.chunk\",\"created\":10,\"model\":\"qwen3.7-plus\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	h := newOpenAIV1Handler(t, upstream, true)
+	body := `{"model":"qwen3.7-plus","messages":[{"role":"user","content":"check latest diff"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if !strings.Contains(bodyOut, `"name":"run_in_terminal"`) {
+		t.Fatalf("expected native run_in_terminal tool call to be preserved: %s", bodyOut)
+	}
+	if strings.Contains(bodyOut, `"name":"cd"`) || strings.Contains(bodyOut, `"name":"git"`) {
+		t.Fatalf("unexpected fake tool names should not be emitted: %s", bodyOut)
+	}
+}
+
+func TestV1ChatCompletions_OpenAI_StreamMiniMaxInvokeSetsToolCallsFinish(t *testing.T) {
+	upstream := "data: {\"id\":\"mmx-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"]<]minimax[>[<tool_call>\\n]<]minimax[>[<invoke name=\\\"run_in_terminal\\\">]<]minimax[>[<command>cd /tmp/demo && git log --oneline</command\",\"role\":\"assistant\"}}],\"created\":1780734753,\"model\":\"MiniMax-M3\",\"object\":\"chat.completion.chunk\"}\n\n" +
+		"data: {\"id\":\"mmx-1\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{\"content\":\">]<]minimax[>[</invoke>\\n]<]minimax[>[</tool_call>\",\"role\":\"assistant\"}}],\"created\":1780734753,\"model\":\"MiniMax-M3\",\"object\":\"chat.completion.chunk\"}\n\n" +
+		"data: [DONE]\n\n"
+
+	h := newOpenAIV1Handler(t, upstream, true)
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"check latest diff"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if !strings.Contains(bodyOut, `"name":"run_in_terminal"`) {
+		t.Fatalf("expected run_in_terminal tool call in rewritten stream: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected finish_reason tool_calls in rewritten stream: %s", bodyOut)
 	}
 }
