@@ -386,6 +386,143 @@ func TestParseTaggedAssistantContent_MiniMaxInvokeStyle(t *testing.T) {
 	}
 }
 
+func TestParseTaggedAssistantContent_MiniMaxInvokeWithValueTags_ReadFile(t *testing.T) {
+	in := `]<]minimax[>[<tool_call>
+]<]minimax[>[<invoke name="read_file">]<]minimax[>[<filePath>/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt]<]minimax[>[</filePath>]<]minimax[>[<startLine>0]<]minimax[>[</startLine>]<]minimax[>[</invoke>
+]<]minimax[>[</tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("expected read_file, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt" {
+		t.Fatalf("unexpected filePath argument: %q", parsed["filePath"])
+	}
+	if parsed["startLine"] != "0" {
+		t.Fatalf("unexpected startLine argument: %q", parsed["startLine"])
+	}
+}
+
+func TestParseTaggedAssistantContent_MiniMaxInvokeWithValueTags_InsertEdit(t *testing.T) {
+	in := `]<]minimax[>[<tool_call>
+]<]minimax[>[<invoke name="insert_edit_into_file">]<]minimax[>[<filePath>/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt]<]minimax[>[</filePath>]<]minimax[>[<newString>test
+]<]minimax[>[</newString>]<]minimax[>[</invoke>
+]<]minimax[>[</tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "insert_edit_into_file" {
+		t.Fatalf("expected insert_edit_into_file, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt" {
+		t.Fatalf("unexpected filePath argument: %q", parsed["filePath"])
+	}
+	if strings.TrimSpace(parsed["newString"]) != "test" {
+		t.Fatalf("unexpected newString argument: %q", parsed["newString"])
+	}
+}
+
+func TestParseTaggedAssistantContent_MiniMaxFencedToolArgsObject(t *testing.T) {
+	in := "I'll read the file first.]<]minimax[>[<tool_call>\n````json\n{ tool: \"read_file\", args: { filePath: \"/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt\" } }\n````"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("expected read_file, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt" {
+		t.Fatalf("unexpected filePath argument: %q", parsed["filePath"])
+	}
+	if strings.Contains(clean, "<tool_call>") {
+		t.Fatalf("tool_call block should be removed from clean content: %q", clean)
+	}
+}
+
+func TestParseTaggedAssistantContent_FilepathSnippetFallbackToCreateFile(t *testing.T) {
+	in := "I'll write \"test\" into the file.````\n// filepath: /home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt\ntest\n````"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "create_file" {
+		t.Fatalf("expected create_file, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt" {
+		t.Fatalf("unexpected filePath argument: %q", parsed["filePath"])
+	}
+	if parsed["content"] != "test" {
+		t.Fatalf("unexpected content argument: %q", parsed["content"])
+	}
+	if strings.Contains(clean, "// filepath:") {
+		t.Fatalf("filepath snippet should be removed from clean content: %q", clean)
+	}
+}
+
+func TestParseTaggedAssistantContent_TaggedToolEnvelopeParameters(t *testing.T) {
+	in := "I'll write \"test\" into the file.]<]minimax[>[<tool_call>\n````\n<tool_name>insert_edit_into_file</tool_name>\n<parameters>\n<relativeWorkspacePath>test.txt</relativeWorkspacePath>\n<file_text>test\n</file_text>\n</parameters>\n````"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected one tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "insert_edit_into_file" {
+		t.Fatalf("expected insert_edit_into_file, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["relativeWorkspacePath"] != "test.txt" {
+		t.Fatalf("unexpected relativeWorkspacePath argument: %q", parsed["relativeWorkspacePath"])
+	}
+	if strings.TrimSpace(parsed["file_text"]) != "test" {
+		t.Fatalf("unexpected file_text argument: %q", parsed["file_text"])
+	}
+	if strings.Contains(clean, "<tool_name>") {
+		t.Fatalf("tagged tool envelope should be removed from clean content: %q", clean)
+	}
+}
+
 func TestParseTaggedAssistantContent_DeepSeekDSMLStyle(t *testing.T) {
 	in := "<｜｜DSML｜｜tool_calls>\n" +
 		"<｜｜DSML｜｜invoke name=\"run_in_terminal\">\n" +
@@ -781,6 +918,105 @@ func TestParseTaggedAssistantContent_LooseToolTextKeepsLeadingContent(t *testing
 	}
 }
 
+func TestParseTaggedAssistantContent_TranscriptToolBlocks(t *testing.T) {
+	in := "The AGENTS.md file was not written. Let me create it now.\n\n```text\n[create_file] creating /home/marcel/workspace/heers/opencode-go-ollama-bridge/AGENTS.md\n\n- one\n- two\n```\n\nLet me verify it now exists.\n\n```text\n[read_file] reading /home/marcel/workspace/heers/opencode-go-ollama-bridge/AGENTS.md\n```\n\nConfirmed."
+
+	clean, toolCalls := parseTaggedAssistantContentWithHints(in, nil)
+	if len(toolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %+v", len(toolCalls), toolCalls)
+	}
+
+	fn0, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn0["name"] != "create_file" {
+		t.Fatalf("expected first tool create_file, got %q", fn0["name"])
+	}
+	args0, _ := fn0["arguments"].(string)
+	var parsed0 map[string]interface{}
+	if err := json.Unmarshal([]byte(args0), &parsed0); err != nil {
+		t.Fatalf("invalid create_file args json: %v (%s)", err, args0)
+	}
+	if parsed0["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/AGENTS.md" {
+		t.Fatalf("create_file filePath wrong: %v", parsed0["filePath"])
+	}
+	if content, _ := parsed0["content"].(string); !strings.Contains(content, "- one") {
+		t.Fatalf("create_file content wrong: %q", content)
+	}
+
+	fn1, _ := toolCalls[1]["function"].(map[string]interface{})
+	if fn1["name"] != "read_file" {
+		t.Fatalf("expected second tool read_file, got %q", fn1["name"])
+	}
+	args1, _ := fn1["arguments"].(string)
+	var parsed1 map[string]interface{}
+	if err := json.Unmarshal([]byte(args1), &parsed1); err != nil {
+		t.Fatalf("invalid read_file args json: %v (%s)", err, args1)
+	}
+	if parsed1["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/AGENTS.md" {
+		t.Fatalf("read_file filePath wrong: %v", parsed1["filePath"])
+	}
+	if start, ok := parsed1["startLine"].(float64); !ok || int(start) != 1 {
+		t.Fatalf("read_file startLine wrong: %v", parsed1["startLine"])
+	}
+	if end, ok := parsed1["endLine"].(float64); !ok || int(end) != 200 {
+		t.Fatalf("read_file endLine wrong: %v", parsed1["endLine"])
+	}
+
+	if strings.Contains(clean, "[create_file]") || strings.Contains(clean, "[read_file]") {
+		t.Fatalf("clean content should not retain transcript tool blocks: %q", clean)
+	}
+	if !strings.Contains(clean, "Confirmed.") {
+		t.Fatalf("clean content missing surrounding assistant text: %q", clean)
+	}
+}
+
+func TestShouldRetryMiniMaxForToolCall_IntentNoToolCalls(t *testing.T) {
+	body := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"Let me actually invoke the tool now: I will use read_file."},"finish_reason":"stop"}]}`)
+	proxyReq := map[string]interface{}{"tool_choice": "required"}
+	if !shouldRetryMiniMaxForToolCall(proxyReq, 1, body) {
+		t.Fatal("expected retry when response promises tool invocation without structured tool_calls")
+	}
+}
+
+func TestShouldRetryMiniMaxForToolCall_HasToolCalls(t *testing.T) {
+	body := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"ok","tool_calls":[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`)
+	proxyReq := map[string]interface{}{"tool_choice": "required"}
+	if shouldRetryMiniMaxForToolCall(proxyReq, 1, body) {
+		t.Fatal("did not expect retry when structured tool_calls are already present")
+	}
+}
+
+func TestShouldRetryMiniMaxForToolCall_DirectFileSnippetNoToolCalls(t *testing.T) {
+	body := []byte("{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"````markdown\\n// filepath: test.txt\\ntest\\n````\"},\"finish_reason\":\"stop\"}]}")
+	proxyReq := map[string]interface{}{"tool_choice": "required"}
+	if !shouldRetryMiniMaxForToolCall(proxyReq, 1, body) {
+		t.Fatal("expected retry when response returns direct file snippet while tool call is required")
+	}
+}
+
+func TestShouldRetryMiniMaxForToolCall_ExplicitAutoDoesNotRetry(t *testing.T) {
+	body := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"I will use read_file now"},"finish_reason":"stop"}]}`)
+	proxyReq := map[string]interface{}{"tool_choice": "auto"}
+	if shouldRetryMiniMaxForToolCall(proxyReq, 1, body) {
+		t.Fatal("did not expect retry when tool_choice is explicitly auto")
+	}
+}
+
+func TestShouldRetryMiniMaxForToolCall_PlainFencedTextNoToolCalls(t *testing.T) {
+	body := []byte("{\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"````text\\ntest\\n````\"},\"finish_reason\":\"stop\"}]}")
+	proxyReq := map[string]interface{}{"tool_choice": "required"}
+	if !shouldRetryMiniMaxForToolCall(proxyReq, 1, body) {
+		t.Fatal("expected retry when required tool call is missing and assistant returns plain fenced text")
+	}
+}
+
+func TestShouldRetryMiniMaxForToolCall_PlainProseNoToolCalls(t *testing.T) {
+	body := []byte(`{"choices":[{"index":0,"message":{"role":"assistant","content":"test"},"finish_reason":"stop"}]}`)
+	proxyReq := map[string]interface{}{"tool_choice": "required"}
+	if !shouldRetryMiniMaxForToolCall(proxyReq, 1, body) {
+		t.Fatal("expected retry when required tool call is missing and assistant returns plain prose")
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -833,6 +1069,323 @@ func newMiniMaxV1Handler(t *testing.T, response string) *Handler {
 
 	c := client.New(srv.URL, "test-key")
 	return New(c, "0.24.0", false, redact.NewNoop())
+}
+
+func newMiniMaxV1HandlerWithAssert(t *testing.T, response string, assertBody func(string)) *Handler {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		if ct := r.Header.Get("Authorization"); ct != "Bearer test-key" {
+			t.Fatalf("unexpected auth header: %s", ct)
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), `"stream":false`) {
+			t.Fatalf("expected bridge to force stream=false for minimax repair path, body=%s", string(body))
+		}
+		if assertBody != nil {
+			assertBody(string(body))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(response))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	return New(c, "0.24.0", false, redact.NewNoop())
+}
+
+func TestV1ChatCompletions_MiniMax_ForceToolChoiceRequiredWhenToolsPresent(t *testing.T) {
+	upstream := `{"id":"mmx-tc-required","object":"chat.completion","created":1,"model":"MiniMax-M3","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
+
+	h := newMiniMaxV1HandlerWithAssert(t, upstream, func(body string) {
+		if !strings.Contains(body, `"tools":[`) {
+			t.Fatalf("test setup expected tools in request body: %s", body)
+		}
+		if !strings.Contains(body, `"tool_choice":"required"`) {
+			t.Fatalf("expected tool_choice=required when tools present, body=%s", body)
+		}
+	})
+
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"write file"}],"tools":[{"type":"function","function":{"name":"create_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]}}}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestV1ChatCompletions_MiniMax_KeepExplicitToolChoice(t *testing.T) {
+	upstream := `{"id":"mmx-tc-explicit","object":"chat.completion","created":1,"model":"MiniMax-M3","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`
+
+	h := newMiniMaxV1HandlerWithAssert(t, upstream, func(body string) {
+		var payload map[string]interface{}
+		if err := json.Unmarshal([]byte(body), &payload); err != nil {
+			t.Fatalf("failed to decode proxied body: %v (%s)", err, body)
+		}
+		tc, ok := payload["tool_choice"].(map[string]interface{})
+		if !ok {
+			t.Fatalf("expected explicit tool_choice object to be preserved, body=%s", body)
+		}
+		fn, ok := tc["function"].(map[string]interface{})
+		if !ok || fn["name"] != "create_file" {
+			t.Fatalf("expected explicit tool_choice.function.name=create_file, body=%s", body)
+		}
+	})
+
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"write file"}],"tools":[{"type":"function","function":{"name":"create_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"content":{"type":"string"}},"required":["filePath","content"]}}}],"tool_choice":{"type":"function","function":{"name":"create_file"}},"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestV1ChatCompletions_MiniMax_RetryIntentOnlyResponseOnce(t *testing.T) {
+	var callCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		callCount++
+
+		if callCount == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"id":"mmx-intent-1","object":"chat.completion","created":1,"model":"MiniMax-M3","choices":[{"index":0,"message":{"role":"assistant","content":"I will now use read_file. Let me actually invoke the tool now:"},"finish_reason":"stop"}]}`))
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "Tool execution is required") {
+			t.Fatalf("expected retry nudge to be injected into second request, body=%s", string(body))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"mmx-intent-2","object":"chat.completion","created":2,"model":"MiniMax-M3","choices":[{"index":0,"message":{"role":"assistant","content":"<tool_call>{\"name\":\"read_file\",\"parameters\":{\"filePath\":\"/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt\",\"startLine\":1,\"endLine\":50}}</tool_call>"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	h := New(c, "0.24.0", false, redact.NewNoop())
+
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"write test into test.txt"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["filePath","startLine","endLine"]}}}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected exactly one retry call (2 total upstream calls), got %d", callCount)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid response JSON: %v (%s)", err, w.Body.String())
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d: %s", len(choices), w.Body.String())
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	msg, _ := choice["message"].(map[string]interface{})
+	toolCalls, _ := msg["tool_calls"].([]interface{})
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 recovered tool_call after retry, got %d: %s", len(toolCalls), w.Body.String())
+	}
+}
+
+func TestV1ChatCompletions_MiniMax_RecoversDirectFileSnippetWithoutRetry(t *testing.T) {
+	var callCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		callCount++
+
+		if callCount == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("{\"id\":\"mmx-file-1\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"<think>plan</think>````markdown\\n// filepath: test.txt\\ntest\\n````\"},\"finish_reason\":\"stop\"}]}"))
+			return
+		}
+
+		t.Fatalf("expected no retry; received unexpected second upstream call")
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	h := New(c, "0.24.0", false, redact.NewNoop())
+
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"write test into test.txt"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["filePath","startLine","endLine"]}}}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if callCount != 1 {
+		t.Fatalf("expected no retry for directly recoverable filepath snippet (1 upstream call), got %d", callCount)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid response JSON: %v (%s)", err, w.Body.String())
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d: %s", len(choices), w.Body.String())
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	msg, _ := choice["message"].(map[string]interface{})
+	toolCalls, _ := msg["tool_calls"].([]interface{})
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 recovered tool_call from filepath snippet, got %d: %s", len(toolCalls), w.Body.String())
+	}
+	fn, _ := toolCalls[0].(map[string]interface{})
+	function, _ := fn["function"].(map[string]interface{})
+	if function["name"] != "create_file" {
+		t.Fatalf("expected create_file from filepath snippet recovery, got %v", function["name"])
+	}
+}
+
+func TestV1ChatCompletions_MiniMax_RetryPlainFencedTextResponseOnce(t *testing.T) {
+	var callCount int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		callCount++
+
+		if callCount == 1 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("{\"id\":\"mmx-plain-1\",\"object\":\"chat.completion\",\"created\":1,\"model\":\"MiniMax-M3\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":\"<think>plan</think>````text\\ntest\\n````\"},\"finish_reason\":\"stop\"}]}") )
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		if !strings.Contains(string(body), "Tool execution is required") {
+			t.Fatalf("expected retry nudge to be injected into second request, body=%s", string(body))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"mmx-plain-2","object":"chat.completion","created":2,"model":"MiniMax-M3","choices":[{"index":0,"message":{"role":"assistant","content":"<tool_call>{\"name\":\"read_file\",\"parameters\":{\"filePath\":\"/home/marcel/workspace/heers/opencode-go-ollama-bridge/test.txt\",\"startLine\":1,\"endLine\":50}}</tool_call>"},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	h := New(c, "0.24.0", false, redact.NewNoop())
+
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"write test into test.txt"}],"tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"filePath":{"type":"string"},"startLine":{"type":"integer"},"endLine":{"type":"integer"}},"required":["filePath","startLine","endLine"]}}}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if callCount != 2 {
+		t.Fatalf("expected exactly one retry call (2 total upstream calls), got %d", callCount)
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid response JSON: %v (%s)", err, w.Body.String())
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d: %s", len(choices), w.Body.String())
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	msg, _ := choice["message"].(map[string]interface{})
+	toolCalls, _ := msg["tool_calls"].([]interface{})
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 recovered tool_call after retry, got %d: %s", len(toolCalls), w.Body.String())
+	}
+}
+
+func TestV1ChatCompletions_MiniMax_SynthesizeWriteToolCallFromProseOnly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/chat/completions" {
+			t.Fatalf("unexpected path: %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"mmx-synth-1","object":"chat.completion","created":1,"model":"MiniMax-M3","choices":[{"index":0,"message":{"role":"assistant","content":"I'll write \"test\" directly into the file using the file editing tool."},"finish_reason":"stop"}]}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c := client.New(srv.URL, "test-key")
+	h := New(c, "0.24.0", false, redact.NewNoop())
+
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"write \"test\" into test.txt without reading first"}],"tools":[{"type":"function","function":{"name":"insert_edit_into_file","parameters":{"type":"object","properties":{"relativeWorkspacePath":{"type":"string"},"file_text":{"type":"string"}},"required":["relativeWorkspacePath","file_text"]}}}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("invalid response JSON: %v (%s)", err, w.Body.String())
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d: %s", len(choices), w.Body.String())
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	if fr, _ := choice["finish_reason"].(string); fr != "tool_calls" {
+		t.Fatalf("expected finish_reason=tool_calls, got %q", fr)
+	}
+	msg, _ := choice["message"].(map[string]interface{})
+	toolCalls, _ := msg["tool_calls"].([]interface{})
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 synthesized tool_call, got %d: %s", len(toolCalls), w.Body.String())
+	}
+	tc, _ := toolCalls[0].(map[string]interface{})
+	fn, _ := tc["function"].(map[string]interface{})
+	if fn["name"] != "insert_edit_into_file" {
+		t.Fatalf("expected insert_edit_into_file, got %v", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid args JSON: %v (%s)", err, args)
+	}
+	if parsed["relativeWorkspacePath"] != "test.txt" {
+		t.Fatalf("expected relativeWorkspacePath=test.txt, got %q", parsed["relativeWorkspacePath"])
+	}
+	if parsed["file_text"] != "test" {
+		t.Fatalf("expected file_text=test, got %q", parsed["file_text"])
+	}
 }
 
 func TestV1ChatCompletions_MiniMax_RepairsNonStreamingContent(t *testing.T) {

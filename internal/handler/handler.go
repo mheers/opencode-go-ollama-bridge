@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -35,6 +36,8 @@ var (
 	// <parameter name="name">value</parameter> — invoke-tag style (MiniMax, Claude-style)
 	// Also handles spaces around = and single-quoted attributes.
 	namedParamTagRE = regexp.MustCompile(`(?is)<parameter\s+name\s*=\s*["']([a-zA-Z_][a-zA-Z0-9_-]*)["']>(.*?)</parameter>`)
+	// <filePath>...</filePath>, <newString>...</newString>, etc. inside <invoke ...>...</invoke>
+	invokeValueTagRE = regexp.MustCompile(`(?is)<([a-zA-Z_][a-zA-Z0-9_-]{1,63})>(.*?)</([a-zA-Z_][a-zA-Z0-9_-]{1,63})>`)
 	// <invoke name="funcname"> — standard form
 	// <invoke name>funcname"> — MiniMax malformed form (= and opening " dropped,
 	//   > closes the tag mid-attribute, funcname" becomes "text" before second >)
@@ -50,6 +53,16 @@ var (
 	bracketCallRE          = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
 	bareCallNameRE         = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
 	looseToolTextRE        = regexp.MustCompile(`(?is)(^|\n\s*\n)\s*([a-zA-Z_][a-zA-Z0-9_-]{1,63})"\s*>\s*(.*?)(?:</tool_call>|$)`)
+	transcriptFenceRE      = regexp.MustCompile("(?is)```+[^\\n]*\\n(.*?)```+")
+	transcriptHeaderRE     = regexp.MustCompile(`^\s*\[([a-zA-Z_][a-zA-Z0-9_-]{1,63})\]\s*(.*?)\s*$`)
+	filepathHeaderRE       = regexp.MustCompile(`(?is)^\s*(?://\s*)?filepath\s*:\s*(.+?)\s*$`)
+	toolNameTagRE          = regexp.MustCompile(`(?is)<tool_name>\s*([a-zA-Z_][a-zA-Z0-9_-]{1,63})\s*</tool_name>`)
+	toolParametersTagRE    = regexp.MustCompile(`(?is)<parameters>(.*?)</parameters>`)
+	toolIntentPromiseRE    = regexp.MustCompile(`(?is)\b(let me|i will|i'll)\b.*\b(tool|invoke|call)\b`)
+	toolActionNameRE       = regexp.MustCompile(`(?is)\b(read_file|create_file|replace_string_in_file|insert_edit_into_file|run_in_terminal|semantic_search|grep_search|file_search)\b`)
+	directFileSnippetRE    = regexp.MustCompile("(?is)`{3,}[a-zA-Z0-9_-]*\\n\\s*(//\\s*)?filepath\\s*:\\s*[^\\n]+\\n")
+	quotedWriteValueRE     = regexp.MustCompile(`(?is)\b(?:write|paste|insert|put)\b[^"'\n]{0,80}["']([^"'\n]{1,400})["']`)
+	filePathHintRE         = regexp.MustCompile("(?i)(/[\\w./-]+|[\\w.-]+\\.[a-z0-9]{1,8})")
 	multiBlankRE           = regexp.MustCompile(`\n{3,}`)
 
 	// DeepSeek DSML format regexes — built at init time to embed the const.
@@ -359,21 +372,29 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 
 		var upstreamResp *http.Response
 		var upstreamErr error
+		var miniMaxProxyReq map[string]interface{}
+		var miniMaxToolCount int
 
 		if adapter.IsMiniMaxModel(modelID) {
 			h.logf("[V1/CHAT] routing to openai backend (repaired minimax path) for %s", modelID)
-			var proxyReq map[string]interface{}
-			if err := json.Unmarshal(body, &proxyReq); err != nil {
+			if err := json.Unmarshal(body, &miniMaxProxyReq); err != nil {
 				http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 				return
 			}
-			proxyReq["model"] = modelID
-			proxyReq["stream"] = false
+			miniMaxProxyReq["model"] = modelID
+			miniMaxProxyReq["stream"] = false
 			// Log tool count so we can tell if tools are reaching the model.
-			if tools, ok := proxyReq["tools"].([]interface{}); ok {
+			if tools, ok := miniMaxProxyReq["tools"].([]interface{}); ok {
+				miniMaxToolCount = len(tools)
 				h.logf("[V1/CHAT] minimax upstream request: %d tools", len(tools))
+				if len(tools) > 0 {
+					if _, hasToolChoice := miniMaxProxyReq["tool_choice"]; !hasToolChoice {
+						miniMaxProxyReq["tool_choice"] = "required"
+						h.logf("[V1/CHAT] minimax upstream request: forcing tool_choice=required")
+					}
+				}
 			}
-			upstreamResp, upstreamErr = h.client.ChatCompletions(proxyReq)
+			upstreamResp, upstreamErr = h.client.ChatCompletions(miniMaxProxyReq)
 		} else {
 			h.logf("[V1/CHAT] routing to openai backend for %s", modelID)
 			var proxyReq map[string]interface{}
@@ -410,11 +431,45 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 		}
 
 		if adapter.IsMiniMaxModel(modelID) {
-			rawBody, repairedBody, err := repairTaggedV1BodyWithHints(upstreamResp.Body, buildToolArgHints(req.Tools))
+			toolHints := buildToolArgHints(req.Tools)
+			rawBody, repairedBody, err := repairTaggedV1BodyWithHints(upstreamResp.Body, toolHints)
 			if err != nil {
 				h.logf("[V1/CHAT] minimax repair decode error: %v", err)
 				http.Error(w, `{"error":"failed to decode upstream response"}`, http.StatusBadGateway)
 				return
+			}
+
+			if shouldRetryMiniMaxForToolCall(miniMaxProxyReq, miniMaxToolCount, repairedBody) {
+				h.logf("[V1/CHAT] minimax response promised tool use without tool_calls; retrying once with strict tool-call nudge")
+				retryReq, ok := buildMiniMaxToolRetryRequest(miniMaxProxyReq)
+				if ok {
+					retryResp, retryErr := h.client.ChatCompletions(retryReq)
+					if retryErr != nil {
+						h.logf("[V1/CHAT] minimax retry request failed: %v", retryErr)
+					} else {
+						defer retryResp.Body.Close()
+						if retryResp.StatusCode < 400 {
+							rawBody2, repairedBody2, err2 := repairTaggedV1BodyWithHints(retryResp.Body, toolHints)
+							if err2 != nil {
+								h.logf("[V1/CHAT] minimax retry repair decode error: %v", err2)
+							} else {
+								rawBody = rawBody2
+								repairedBody = repairedBody2
+								h.logf("[V1/CHAT] minimax retry succeeded")
+							}
+						} else {
+							respBody, _ := io.ReadAll(io.LimitReader(retryResp.Body, 16384))
+							h.logf("[V1/CHAT] minimax retry status %d: %s", retryResp.StatusCode, string(respBody))
+						}
+					}
+				}
+			}
+
+			if miniMaxRequestRequiresToolCall(miniMaxProxyReq, miniMaxToolCount) {
+				if synthesized, ok := synthesizeMiniMaxWriteToolCallFromContext(req.Messages, req.Tools, repairedBody); ok {
+					repairedBody = synthesized
+					h.logf("[V1/CHAT] minimax synthesized write tool call from context after prose-only response")
+				}
 			}
 
 			h.logBody("[V1/CHAT] upstream raw body:", rawBody)
@@ -866,6 +921,284 @@ func repairTaggedV1BodyWithHints(r io.Reader, toolArgHints map[string]string) ([
 	return body, repaired, nil
 }
 
+func shouldRetryMiniMaxForToolCall(proxyReq map[string]interface{}, toolCount int, repairedBody []byte) bool {
+	if !miniMaxRequestRequiresToolCall(proxyReq, toolCount) {
+		return false
+	}
+
+	var payload map[string]interface{}
+	if err := json.Unmarshal(repairedBody, &payload); err != nil {
+		return false
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) == 0 {
+		return false
+	}
+	sawNonEmptyAssistantContent := false
+
+	for _, c := range choices {
+		choice, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		msg, ok := choice["message"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if tcs, ok := msg["tool_calls"].([]interface{}); ok && len(tcs) > 0 {
+			return false
+		}
+		content, _ := msg["content"].(string)
+		content = strings.TrimSpace(content)
+		if content == "" {
+			continue
+		}
+		sawNonEmptyAssistantContent = true
+		if toolIntentPromiseRE.MatchString(content) && toolActionNameRE.MatchString(content) {
+			return true
+		}
+		if directFileSnippetRE.MatchString(content) {
+			return true
+		}
+	}
+
+	// If tool use is required and the assistant still returned plain content
+	// without structured tool_calls, do a one-shot retry with stricter nudge.
+	return sawNonEmptyAssistantContent
+}
+
+func miniMaxRequestRequiresToolCall(proxyReq map[string]interface{}, toolCount int) bool {
+	if toolCount == 0 || proxyReq == nil {
+		return false
+	}
+
+	tc, ok := proxyReq["tool_choice"]
+	if !ok {
+		return true
+	}
+
+	switch v := tc.(type) {
+	case string:
+		s := strings.ToLower(strings.TrimSpace(v))
+		if s == "none" || s == "auto" {
+			return false
+		}
+		return true
+	case map[string]interface{}:
+		return true
+	default:
+		return true
+	}
+}
+
+func buildMiniMaxToolRetryRequest(orig map[string]interface{}) (map[string]interface{}, bool) {
+	if orig == nil {
+		return nil, false
+	}
+
+	b, err := json.Marshal(orig)
+	if err != nil {
+		return nil, false
+	}
+	var retry map[string]interface{}
+	if err := json.Unmarshal(b, &retry); err != nil {
+		return nil, false
+	}
+
+	tools, ok := retry["tools"].([]interface{})
+	if !ok || len(tools) == 0 {
+		return nil, false
+	}
+
+	if _, hasToolChoice := retry["tool_choice"]; !hasToolChoice {
+		retry["tool_choice"] = "required"
+	}
+
+	msgs, ok := retry["messages"].([]interface{})
+	if !ok {
+		return nil, false
+	}
+	msgs = append(msgs, map[string]interface{}{
+		"role":    "system",
+		"content": "Tool execution is required for this turn. Respond with tool_calls only and no explanatory text.",
+	})
+	retry["messages"] = msgs
+	retry["stream"] = false
+
+	return retry, true
+}
+
+func synthesizeMiniMaxWriteToolCallFromContext(messagesRaw, toolsRaw, repairedBody []byte) ([]byte, bool) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(repairedBody, &payload); err != nil {
+		return nil, false
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) == 0 {
+		return nil, false
+	}
+
+	choice, ok := choices[0].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	msg, ok := choice["message"].(map[string]interface{})
+	if !ok {
+		return nil, false
+	}
+	if tcs, ok := msg["tool_calls"].([]interface{}); ok && len(tcs) > 0 {
+		return nil, false
+	}
+
+	userText := extractLatestUserMessageText(messagesRaw)
+	if userText == "" {
+		return nil, false
+	}
+	filePath := extractFilePathHint(userText)
+	text := extractQuotedWriteValue(userText)
+	if filePath == "" || text == "" {
+		return nil, false
+	}
+
+	toolName, pathKey, contentKey := selectWriteToolAndKeys(toolsRaw)
+	if toolName == "" || pathKey == "" || contentKey == "" {
+		return nil, false
+	}
+
+	if pathKey == "relativeWorkspacePath" {
+		filePath = filepath.Base(filePath)
+	}
+
+	args := map[string]string{
+		pathKey:    filePath,
+		contentKey: text,
+	}
+	argsJSON := "{}"
+	if b, err := json.Marshal(args); err == nil {
+		argsJSON = string(b)
+	}
+
+	msg["tool_calls"] = []interface{}{map[string]interface{}{
+		"id":   "call_0",
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      toolName,
+			"arguments": argsJSON,
+		},
+	}}
+	if fr, ok := choice["finish_reason"].(string); !ok || fr == "" || fr == "stop" {
+		choice["finish_reason"] = "tool_calls"
+	}
+
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, false
+	}
+	return b, true
+}
+
+func extractLatestUserMessageText(messagesRaw []byte) string {
+	if len(messagesRaw) == 0 {
+		return ""
+	}
+	var msgs []map[string]interface{}
+	if err := json.Unmarshal(messagesRaw, &msgs); err != nil {
+		return ""
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		m := msgs[i]
+		if role, _ := m["role"].(string); role != "user" {
+			continue
+		}
+		switch c := m["content"].(type) {
+		case string:
+			return strings.TrimSpace(c)
+		case []interface{}:
+			parts := make([]string, 0)
+			for _, p := range c {
+				obj, ok := p.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				if t, _ := obj["type"].(string); t != "text" {
+					continue
+				}
+				if txt, _ := obj["text"].(string); strings.TrimSpace(txt) != "" {
+					parts = append(parts, strings.TrimSpace(txt))
+				}
+			}
+			return strings.TrimSpace(strings.Join(parts, "\n"))
+		}
+	}
+	return ""
+}
+
+func extractQuotedWriteValue(s string) string {
+	m := quotedWriteValueRE.FindStringSubmatch(s)
+	if len(m) < 2 {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+func extractFilePathHint(s string) string {
+	all := filePathHintRE.FindAllString(s, -1)
+	if len(all) == 0 {
+		return ""
+	}
+	v := strings.TrimSpace(all[len(all)-1])
+	v = strings.Trim(v, "`\"'.,:;)")
+	return v
+}
+
+func selectWriteToolAndKeys(toolsRaw []byte) (toolName, pathKey, contentKey string) {
+	if len(toolsRaw) == 0 {
+		return "", "", ""
+	}
+	var tools []adapter.OpenAITool
+	if err := json.Unmarshal(toolsRaw, &tools); err != nil {
+		return "", "", ""
+	}
+
+	for _, preferred := range []string{"create_file", "insert_edit_into_file"} {
+		for _, t := range tools {
+			if strings.TrimSpace(t.Function.Name) != preferred {
+				continue
+			}
+			pk, ck := inferWriteParamKeys(t.Function.Parameters)
+			if pk != "" && ck != "" {
+				return preferred, pk, ck
+			}
+		}
+	}
+	return "", "", ""
+}
+
+func inferWriteParamKeys(parameters json.RawMessage) (pathKey, contentKey string) {
+	if len(parameters) == 0 {
+		return "", ""
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(parameters, &schema); err != nil {
+		return "", ""
+	}
+	for _, k := range []string{"filePath", "relativeWorkspacePath", "path", "filepath"} {
+		if _, ok := schema.Properties[k]; ok {
+			pathKey = k
+			break
+		}
+	}
+	for _, k := range []string{"content", "file_text", "newString", "newText", "text"} {
+		if _, ok := schema.Properties[k]; ok {
+			contentKey = k
+			break
+		}
+	}
+	return pathKey, contentKey
+}
+
 func sanitizeTaggedText(s string) string {
 	s = miniMaxWrapperRE.ReplaceAllString(s, "")
 	s = thinkBlockRE.ReplaceAllString(s, "")
@@ -890,6 +1223,7 @@ func parseTaggedAssistantContentWithHints(content string, toolArgHints map[strin
 	cleanSource := content
 	if len(toolCalls) > 0 {
 		cleanSource = stripRecoveredLooseToolText(cleanSource)
+		cleanSource = stripRecoveredTranscriptToolText(cleanSource)
 	}
 	clean := sanitizeTaggedText(cleanSource)
 	return clean, toolCalls
@@ -1114,28 +1448,7 @@ func extractPluralToolCalls(raw string) []map[string]interface{} {
 				continue
 			}
 			invokeMatched = true
-			params := map[string]string{}
-			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
-				params["command"] = strings.TrimSpace(cm[1])
-			}
-			// Try invoke-style <parameter name="key">val</parameter> first.
-			for _, pm := range namedParamTagRE.FindAllStringSubmatch(im[2], -1) {
-				if len(pm) < 3 {
-					continue
-				}
-				if k := strings.TrimSpace(pm[1]); k != "" {
-					params[k] = strings.TrimSpace(pm[2])
-				}
-			}
-			// Also try function-style <parameter=key>val</parameter>.
-			for _, pm := range parameterTagRE.FindAllStringSubmatch(im[2], -1) {
-				if len(pm) < 3 {
-					continue
-				}
-				if k := strings.TrimSpace(pm[1]); k != "" {
-					params[k] = strings.TrimSpace(pm[2])
-				}
-			}
+			params := collectInvokeParams(im[2])
 			argsJSON := "{}"
 			if b, err := json.Marshal(params); err == nil {
 				argsJSON = string(b)
@@ -1270,6 +1583,88 @@ func inferMalformedInvokeToolName(params map[string]string) string {
 	return ""
 }
 
+func collectInvokeParams(body string) map[string]string {
+	params := map[string]string{}
+	if cm := commandTagRE.FindStringSubmatch(body); len(cm) >= 2 {
+		params["command"] = strings.TrimSpace(cm[1])
+	}
+	for _, pm := range namedParamTagRE.FindAllStringSubmatch(body, -1) {
+		if len(pm) < 3 {
+			continue
+		}
+		k := strings.TrimSpace(pm[1])
+		v := strings.TrimSpace(pm[2])
+		if k != "" {
+			params[k] = v
+		}
+	}
+	for _, pm := range parameterTagRE.FindAllStringSubmatch(body, -1) {
+		if len(pm) < 3 {
+			continue
+		}
+		k := strings.TrimSpace(pm[1])
+		v := strings.TrimSpace(pm[2])
+		if k != "" {
+			params[k] = v
+		}
+	}
+	for _, pm := range invokeValueTagRE.FindAllStringSubmatch(body, -1) {
+		if len(pm) < 4 {
+			continue
+		}
+		k := strings.TrimSpace(pm[1])
+		end := strings.TrimSpace(pm[3])
+		if k == "" {
+			continue
+		}
+		if !strings.EqualFold(k, end) {
+			continue
+		}
+		switch strings.ToLower(k) {
+		case "invoke", "function", "parameter", "tool_call", "tool_calls", "think", "command":
+			continue
+		}
+		v := strings.TrimSpace(pm[2])
+		if v == "" {
+			continue
+		}
+		if _, exists := params[k]; !exists {
+			params[k] = v
+		}
+	}
+	return params
+}
+
+func extractTaggedToolEnvelopeCall(body string, callIdx int) map[string]interface{} {
+	nameMatch := toolNameTagRE.FindStringSubmatch(body)
+	if len(nameMatch) < 2 {
+		return nil
+	}
+	name := strings.TrimSpace(nameMatch[1])
+	if !bareCallNameRE.MatchString(strings.ToLower(name)) {
+		return nil
+	}
+
+	params := map[string]string{}
+	if pm := toolParametersTagRE.FindStringSubmatch(body); len(pm) >= 2 {
+		params = collectInvokeParams(pm[1])
+	}
+
+	argsJSON := "{}"
+	if b, err := json.Marshal(params); err == nil {
+		argsJSON = string(b)
+	}
+
+	return map[string]interface{}{
+		"id":   fmt.Sprintf("call_%d", callIdx),
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      name,
+			"arguments": argsJSON,
+		},
+	}
+}
+
 func extractLooseToolText(raw string, toolArgHints map[string]string) []map[string]interface{} {
 	if len(toolArgHints) == 0 {
 		return nil
@@ -1320,6 +1715,74 @@ func stripRecoveredLooseToolText(raw string) string {
 		return raw
 	}
 	return normalized[:nameStart]
+}
+
+func stripRecoveredTranscriptToolText(raw string) string {
+	normalized := miniMaxWrapperRE.ReplaceAllString(raw, "")
+	cleaned := transcriptFenceRE.ReplaceAllString(normalized, "")
+	cleaned = strings.TrimSpace(cleaned)
+	cleaned = multiBlankRE.ReplaceAllString(cleaned, "\n\n")
+	return cleaned
+}
+
+// extractFilepathSnippetToolCall recovers a pseudo tool call from fenced text like:
+// ```
+// // filepath: /tmp/demo/test.txt
+// hello
+// ```
+// This pattern appears when a model intends an edit but emits markdown instead
+// of a structured tool call. We map it to create_file(filePath, content).
+func extractFilepathSnippetToolCall(raw string) []map[string]interface{} {
+	normalized := miniMaxWrapperRE.ReplaceAllString(raw, "")
+	normalized = thinkBlockRE.ReplaceAllString(normalized, "")
+
+	for _, fm := range transcriptFenceRE.FindAllStringSubmatch(normalized, -1) {
+		if len(fm) < 2 {
+			continue
+		}
+		fenced := strings.TrimSpace(fm[1])
+		if fenced == "" {
+			continue
+		}
+
+		lines := strings.Split(fenced, "\n")
+		if len(lines) < 2 {
+			continue
+		}
+		header := strings.TrimSpace(lines[0])
+		hm := filepathHeaderRE.FindStringSubmatch(header)
+		if len(hm) < 2 {
+			continue
+		}
+		filePath := strings.TrimSpace(hm[1])
+		filePath = strings.Trim(filePath, "`\"'")
+		if filePath == "" {
+			continue
+		}
+
+		content := strings.Join(lines[1:], "\n")
+		content = strings.TrimSpace(content)
+
+		args := map[string]string{
+			"filePath": filePath,
+			"content":  content,
+		}
+		argsJSON := "{}"
+		if b, err := json.Marshal(args); err == nil {
+			argsJSON = string(b)
+		}
+
+		return []map[string]interface{}{{
+			"id":   "call_0",
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      "create_file",
+				"arguments": argsJSON,
+			},
+		}}
+	}
+
+	return nil
 }
 
 // splitOnToolCallTag splits s on every occurrence of "<tool_call>" (case-insensitive)
@@ -1466,7 +1929,13 @@ func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map
 		}
 	}
 	if len(matches) == 0 {
-		return extractLooseToolText(raw, toolArgHints)
+		if tcs := extractTranscriptToolText(raw, toolArgHints); len(tcs) > 0 {
+			return tcs
+		}
+		if tcs := extractLooseToolText(raw, toolArgHints); len(tcs) > 0 {
+			return tcs
+		}
+		return extractFilepathSnippetToolCall(raw)
 	}
 
 	out := make([]map[string]interface{}, 0)
@@ -1481,9 +1950,17 @@ func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map
 			continue
 		}
 
+		jsonInner := inner
+		if fence := transcriptFenceRE.FindStringSubmatch(inner); len(fence) >= 2 {
+			fenced := strings.TrimSpace(fence[1])
+			if fenced != "" {
+				jsonInner = fenced
+			}
+		}
+
 		callsBeforeBlock := len(out)
 
-		dec := json.NewDecoder(strings.NewReader(inner))
+		dec := json.NewDecoder(strings.NewReader(jsonInner))
 		parsedAny := false
 		for {
 			var obj map[string]interface{}
@@ -1590,7 +2067,7 @@ func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map
 		// JSON parse failed — try normalizing JavaScript-style object syntax
 		// where keys may be unquoted: { tool: "name", args: {...} }
 		// This is the MiniMax-M3 format as of 2026-06.
-		if normalized := normalizeJSObject(inner); normalized != inner {
+		if normalized := normalizeJSObject(jsonInner); normalized != jsonInner {
 			dec2 := json.NewDecoder(strings.NewReader(normalized))
 			for {
 				var obj map[string]interface{}
@@ -1681,34 +2158,7 @@ func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map
 				continue
 			}
 
-			params := map[string]string{}
-			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
-				params["command"] = strings.TrimSpace(cm[1])
-			}
-			// Try invoke-style <parameter name="key">val</parameter> first.
-			for _, pm := range namedParamTagRE.FindAllStringSubmatch(im[2], -1) {
-				if len(pm) < 3 {
-					continue
-				}
-				k := strings.TrimSpace(pm[1])
-				v := strings.TrimSpace(pm[2])
-				if k == "" {
-					continue
-				}
-				params[k] = v
-			}
-			// Also try function-style <parameter=key>val</parameter>.
-			for _, pm := range parameterTagRE.FindAllStringSubmatch(im[2], -1) {
-				if len(pm) < 3 {
-					continue
-				}
-				k := strings.TrimSpace(pm[1])
-				v := strings.TrimSpace(pm[2])
-				if k == "" {
-					continue
-				}
-				params[k] = v
-			}
+			params := collectInvokeParams(im[2])
 
 			argsJSON := "{}"
 			if b, err := json.Marshal(params); err == nil {
@@ -1844,6 +2294,12 @@ func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map
 			callIdx++
 		}
 
+		if tc := extractTaggedToolEnvelopeCall(jsonInner, callIdx); tc != nil {
+			out = append(out, tc)
+			callIdx++
+			continue
+		}
+
 		// Last fallback: plain tool names inside the block (no args available).
 		// Restrict to function-like names (must contain underscore) to avoid false calls like cd/git/log.
 		for _, tok := range strings.Fields(inner) {
@@ -1870,9 +2326,131 @@ func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map
 	}
 
 	if len(out) == 0 {
+		if tcs := extractTranscriptToolText(raw, toolArgHints); len(tcs) > 0 {
+			return tcs
+		}
 		return extractLooseToolText(raw, toolArgHints)
 	}
 	return out
+}
+
+func extractTranscriptToolText(raw string, toolArgHints map[string]string) []map[string]interface{} {
+	normalized := miniMaxWrapperRE.ReplaceAllString(raw, "")
+	normalized = thinkBlockRE.ReplaceAllString(normalized, "")
+
+	blocks := transcriptFenceRE.FindAllStringSubmatch(normalized, -1)
+	if len(blocks) == 0 {
+		return nil
+	}
+
+	out := make([]map[string]interface{}, 0)
+	callIdx := 0
+
+	for _, block := range blocks {
+		if len(block) < 2 {
+			continue
+		}
+		body := block[1]
+		lines := strings.Split(body, "\n")
+
+		headIdx := -1
+		toolName := ""
+		headTail := ""
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "" {
+				continue
+			}
+			if m := transcriptHeaderRE.FindStringSubmatch(trimmed); len(m) >= 3 {
+				headIdx = i
+				toolName = strings.TrimSpace(m[1])
+				headTail = strings.TrimSpace(m[2])
+			}
+			break
+		}
+		if headIdx < 0 || toolName == "" {
+			continue
+		}
+
+		remainder := ""
+		if headIdx+1 < len(lines) {
+			remainder = strings.TrimSpace(strings.Join(lines[headIdx+1:], "\n"))
+		}
+
+		argsMap := map[string]interface{}{}
+		switch toolName {
+		case "create_file":
+			if path := parseTranscriptPath(headTail, "creating ", "create "); path != "" {
+				argsMap["filePath"] = path
+			}
+			if remainder != "" {
+				argsMap["content"] = remainder
+			}
+			if _, ok := argsMap["filePath"]; !ok {
+				continue
+			}
+			if _, ok := argsMap["content"]; !ok {
+				continue
+			}
+		case "read_file":
+			path := parseTranscriptPath(headTail, "reading ", "read ")
+			if path == "" && remainder != "" {
+				path = strings.TrimSpace(strings.Split(remainder, "\n")[0])
+			}
+			if path == "" {
+				continue
+			}
+			argsMap["filePath"] = path
+			argsMap["startLine"] = 1
+			argsMap["endLine"] = 200
+		default:
+			if argKey := toolArgHints[toolName]; argKey != "" {
+				value := strings.TrimSpace(remainder)
+				if value == "" {
+					value = strings.TrimSpace(headTail)
+				}
+				if value == "" {
+					continue
+				}
+				argsMap[argKey] = value
+			} else {
+				continue
+			}
+		}
+
+		argsJSON := "{}"
+		if b, err := json.Marshal(argsMap); err == nil {
+			argsJSON = string(b)
+		}
+
+		out = append(out, map[string]interface{}{
+			"id":   fmt.Sprintf("call_%d", callIdx),
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      toolName,
+				"arguments": argsJSON,
+			},
+		})
+		callIdx++
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func parseTranscriptPath(s string, prefixes ...string) string {
+	text := strings.TrimSpace(s)
+	lower := strings.ToLower(text)
+	for _, p := range prefixes {
+		if strings.HasPrefix(lower, p) {
+			path := strings.TrimSpace(text[len(p):])
+			path = strings.Trim(path, "`\"')(")
+			return strings.TrimSpace(path)
+		}
+	}
+	return ""
 }
 
 func toolCallsToDelta(toolCalls []map[string]interface{}) []map[string]interface{} {
