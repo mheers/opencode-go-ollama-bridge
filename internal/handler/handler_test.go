@@ -646,6 +646,87 @@ func TestParseTaggedAssistantContent_MiniMaxM3JSObjectFormat(t *testing.T) {
 	}
 }
 
+func TestParseTaggedAssistantContent_MiniMaxInvokeWithParameters(t *testing.T) {
+	// MiniMax-M3 format: invoke with <parameter name="key"> attributes.
+	// Each line is prefixed with the minimax wrapper.
+	in := `]<]minimax[>[<tool_call>
+]<]minimax[>[<invoke name="runSubagent">]<]minimax[>[<parameter name="agentName">Explore</parameter>
+<parameter name="prompt">Explore the repo thoroughly.</parameter>
+</invoke>
+]<]minimax[>[</tool_call>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_call>") || strings.Contains(clean, "minimax") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "runSubagent" {
+		t.Fatalf("expected runSubagent, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["agentName"] != "Explore" {
+		t.Fatalf("unexpected agentName: %q", parsed["agentName"])
+	}
+	if parsed["prompt"] != "Explore the repo thoroughly." {
+		t.Fatalf("unexpected prompt: %q", parsed["prompt"])
+	}
+}
+
+func TestParseTaggedAssistantContent_MiniMaxInvokeReadFile(t *testing.T) {
+	// read_file via MiniMax invoke format — the exact failure reported as
+	// "must have required property 'filePath'".
+	in := `]<]minimax[>[<tool_call>]<]minimax[>[<invoke name="read_file">]<]minimax[>[<parameter name="filePath">/home/foo/handler.go</parameter>
+<parameter name="startLine">1</parameter>
+<parameter name="endLine">50</parameter>
+]<]minimax[>[</invoke>
+]<]minimax[>[</tool_call>`
+
+	_, toolCalls := parseTaggedAssistantContent(in)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("expected read_file, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "/home/foo/handler.go" {
+		t.Fatalf("filePath wrong: %q", parsed["filePath"])
+	}
+	if parsed["startLine"] != "1" {
+		t.Fatalf("startLine wrong: %q", parsed["startLine"])
+	}
+}
+
+func TestParseTaggedAssistantContent_MiniMaxInvokeMalformedAttr(t *testing.T) {
+	// MiniMax emits <invoke name>funcname"> (drops the = and opening "),
+	// which closes the tag at 'name>' making the function name appear as text.
+	// Log excerpt: ]<]minimax[>[<invoke name>read_file">]<]minimax[>[</invoke>
+	in := `]<]minimax[>[<tool_call>
+]<]minimax[>[<invoke name>read_file">]<]minimax[>[</invoke>
+]<]minimax[>[</tool_call>`
+
+	_, toolCalls := parseTaggedAssistantContent(in)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call (name only, empty args), got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("expected read_file, got %q", fn["name"])
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

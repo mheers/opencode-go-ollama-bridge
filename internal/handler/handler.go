@@ -26,14 +26,23 @@ var (
 	toolCallInnerRE  = regexp.MustCompile(`(?is)<tool_call\b[^>]*>(.*?)</tool_call>`)
 	toolCallBlockRE  = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*?</tool_call>`)
 	functionTagRE    = regexp.MustCompile(`(?is)<function\s+([a-zA-Z_][a-zA-Z0-9_-]*)>(.*?)</function>`)
-	parameterTagRE   = regexp.MustCompile(`(?is)<parameter=([a-zA-Z_][a-zA-Z0-9_-]*)>(.*?)</parameter>`)
-	invokeTagRE      = regexp.MustCompile(`(?is)<invoke\s+name=\"([a-zA-Z_][a-zA-Z0-9_-]*)\">(.*?)</invoke>`)
-	commandTagRE     = regexp.MustCompile(`(?is)<command>(.*?)</command>`)
-	thinkTailRE      = regexp.MustCompile(`(?is)<think>.*$`)
-	toolCallTailRE   = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*$`)
-	bracketCallRE    = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
-	bareCallNameRE   = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
-	multiBlankRE     = regexp.MustCompile(`\n{3,}`)
+	// <parameter=name>value</parameter> — function-tag style
+	parameterTagRE = regexp.MustCompile(`(?is)<parameter=([a-zA-Z_][a-zA-Z0-9_-]*)>(.*?)</parameter>`)
+
+	// <parameter name="name">value</parameter> — invoke-tag style (MiniMax, Claude-style)
+	// Also handles spaces around = and single-quoted attributes.
+	namedParamTagRE = regexp.MustCompile(`(?is)<parameter\s+name\s*=\s*["']([a-zA-Z_][a-zA-Z0-9_-]*)["']>(.*?)</parameter>`)
+	// <invoke name="funcname"> — standard form
+	// <invoke name>funcname"> — MiniMax malformed form (= and opening " dropped,
+	//   > closes the tag mid-attribute, funcname" becomes "text" before second >)
+	// Both are handled by treating [=>] as the separator between "name" and the value.
+	invokeTagRE    = regexp.MustCompile(`(?is)<invoke\s+name\s*[=>]\s*"?([a-zA-Z_][a-zA-Z0-9_-]*)"?>(.*?)</invoke>`)
+	commandTagRE   = regexp.MustCompile(`(?is)<command>(.*?)</command>`)
+	thinkTailRE    = regexp.MustCompile(`(?is)<think>.*$`)
+	toolCallTailRE = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*$`)
+	bracketCallRE  = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
+	bareCallNameRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
+	multiBlankRE   = regexp.MustCompile(`\n{3,}`)
 
 	// DeepSeek DSML format regexes — built at init time to embed the const.
 	dsmlToolCallsBlockRE = regexp.MustCompile(`(?is)<` + dsmlSep + `tool_calls>(.*?)</` + dsmlSep + `tool_calls>`)
@@ -313,6 +322,10 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 			}
 			proxyReq["model"] = modelID
 			proxyReq["stream"] = false
+			// Log tool count so we can tell if tools are reaching the model.
+			if tools, ok := proxyReq["tools"].([]interface{}); ok {
+				h.logf("[V1/CHAT] minimax upstream request: %d tools", len(tools))
+			}
 			upstreamResp, upstreamErr = h.client.ChatCompletions(proxyReq)
 		} else {
 			h.logf("[V1/CHAT] routing to openai backend for %s", modelID)
@@ -995,6 +1008,16 @@ func extractPluralToolCalls(raw string) []map[string]interface{} {
 			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
 				params["command"] = strings.TrimSpace(cm[1])
 			}
+			// Try invoke-style <parameter name="key">val</parameter> first.
+			for _, pm := range namedParamTagRE.FindAllStringSubmatch(im[2], -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				if k := strings.TrimSpace(pm[1]); k != "" {
+					params[k] = strings.TrimSpace(pm[2])
+				}
+			}
+			// Also try function-style <parameter=key>val</parameter>.
 			for _, pm := range parameterTagRE.FindAllStringSubmatch(im[2], -1) {
 				if len(pm) < 3 {
 					continue
@@ -1486,6 +1509,19 @@ func extractToolCalls(raw string) []map[string]interface{} {
 			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
 				params["command"] = strings.TrimSpace(cm[1])
 			}
+			// Try invoke-style <parameter name="key">val</parameter> first.
+			for _, pm := range namedParamTagRE.FindAllStringSubmatch(im[2], -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				k := strings.TrimSpace(pm[1])
+				v := strings.TrimSpace(pm[2])
+				if k == "" {
+					continue
+				}
+				params[k] = v
+			}
+			// Also try function-style <parameter=key>val</parameter>.
 			for _, pm := range parameterTagRE.FindAllStringSubmatch(im[2], -1) {
 				if len(pm) < 3 {
 					continue
