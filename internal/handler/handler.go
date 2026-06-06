@@ -16,6 +16,10 @@ import (
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
 )
 
+// dsmlSep is the fence used by DeepSeek's DSML tool-call markup:
+// <｜｜DSML｜｜tool_calls> / <｜｜DSML｜｜invoke name="…"> / <｜｜DSML｜｜parameter name="…">
+const dsmlSep = "｜｜DSML｜｜"
+
 var (
 	miniMaxWrapperRE = regexp.MustCompile(`\]<\]minimax\[>\[`)
 	thinkBlockRE     = regexp.MustCompile(`(?is)<think>.*?</think>`)
@@ -30,6 +34,12 @@ var (
 	bracketCallRE    = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
 	bareCallNameRE   = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
 	multiBlankRE     = regexp.MustCompile(`\n{3,}`)
+
+	// DeepSeek DSML format regexes — built at init time to embed the const.
+	dsmlToolCallsBlockRE = regexp.MustCompile(`(?is)<` + dsmlSep + `tool_calls>(.*?)</` + dsmlSep + `tool_calls>`)
+	dsmlInvokeRE         = regexp.MustCompile(`(?is)<` + dsmlSep + `invoke\s+name="([^"]+)">(.*?)</` + dsmlSep + `invoke>`)
+	dsmlParamRE          = regexp.MustCompile(`(?is)<` + dsmlSep + `parameter\s+name="([^"]+)"[^>]*>(.*?)</` + dsmlSep + `parameter>`)
+	dsmlToolCallsTailRE  = regexp.MustCompile(`(?is)<` + dsmlSep + `tool_calls>.*$`)
 )
 
 type Handler struct {
@@ -446,8 +456,10 @@ func sanitizeTaggedText(s string) string {
 	s = miniMaxWrapperRE.ReplaceAllString(s, "")
 	s = thinkBlockRE.ReplaceAllString(s, "")
 	s = toolCallBlockRE.ReplaceAllString(s, "")
+	s = dsmlToolCallsBlockRE.ReplaceAllString(s, "")
 	s = thinkTailRE.ReplaceAllString(s, "")
 	s = toolCallTailRE.ReplaceAllString(s, "")
+	s = dsmlToolCallsTailRE.ReplaceAllString(s, "")
 	s = strings.TrimSpace(s)
 	s = multiBlankRE.ReplaceAllString(s, "\n\n")
 	return s
@@ -459,7 +471,74 @@ func parseTaggedAssistantContent(content string) (string, []map[string]interface
 	return clean, toolCalls
 }
 
+// extractDSMLToolCalls handles DeepSeek's DSML markup format:
+//
+//	<｜｜DSML｜｜tool_calls>
+//	<｜｜DSML｜｜invoke name="run_in_terminal">
+//	<｜｜DSML｜｜parameter name="command" string="true">cd /tmp && ls</｜｜DSML｜｜parameter>
+//	</｜｜DSML｜｜invoke>
+//	</｜｜DSML｜｜tool_calls>
+func extractDSMLToolCalls(raw string) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0)
+	callIdx := 0
+
+	for _, blockMatch := range dsmlToolCallsBlockRE.FindAllStringSubmatch(raw, -1) {
+		if len(blockMatch) < 2 {
+			continue
+		}
+		blockInner := blockMatch[1]
+
+		for _, im := range dsmlInvokeRE.FindAllStringSubmatch(blockInner, -1) {
+			if len(im) < 3 {
+				continue
+			}
+			name := strings.TrimSpace(im[1])
+			if name == "" {
+				continue
+			}
+
+			params := map[string]string{}
+			for _, pm := range dsmlParamRE.FindAllStringSubmatch(im[2], -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				k := strings.TrimSpace(pm[1])
+				v := strings.TrimSpace(pm[2])
+				if k == "" {
+					continue
+				}
+				params[k] = v
+			}
+
+			argsJSON := "{}"
+			if b, err := json.Marshal(params); err == nil {
+				argsJSON = string(b)
+			}
+
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func extractToolCalls(raw string) []map[string]interface{} {
+	// DeepSeek DSML format: <｜｜DSML｜｜tool_calls>...<｜｜DSML｜｜invoke name="fn">...<｜｜DSML｜｜invoke>...
+	if dsmlMatches := dsmlToolCallsBlockRE.FindAllStringSubmatch(raw, -1); len(dsmlMatches) > 0 {
+		return extractDSMLToolCalls(raw)
+	}
+
 	matches := toolCallInnerRE.FindAllStringSubmatch(raw, -1)
 	if len(matches) == 0 {
 		return nil

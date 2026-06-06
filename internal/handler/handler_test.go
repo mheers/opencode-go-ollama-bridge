@@ -383,6 +383,40 @@ func TestParseTaggedAssistantContent_MiniMaxInvokeStyle(t *testing.T) {
 	}
 }
 
+func TestParseTaggedAssistantContent_DeepSeekDSMLStyle(t *testing.T) {
+	in := "<｜｜DSML｜｜tool_calls>\n" +
+		"<｜｜DSML｜｜invoke name=\"run_in_terminal\">\n" +
+		"<｜｜DSML｜｜parameter name=\"command\" string=\"true\">cd /tmp/demo && wc -l * 2>/dev/null</｜｜DSML｜｜parameter>\n" +
+		"<｜｜DSML｜｜parameter name=\"explanation\" string=\"true\">Re-check line counts for all files</｜｜DSML｜｜parameter>\n" +
+		"<｜｜DSML｜｜parameter name=\"goal\" string=\"true\">Verify line counts</｜｜DSML｜｜parameter>\n" +
+		"<｜｜DSML｜｜parameter name=\"mode\" string=\"true\">sync</｜｜DSML｜｜parameter>\n" +
+		"</｜｜DSML｜｜invoke>\n" +
+		"</｜｜DSML｜｜tool_calls>"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["command"] != "cd /tmp/demo && wc -l * 2>/dev/null" {
+		t.Fatalf("unexpected command argument: %q", parsed["command"])
+	}
+	if parsed["mode"] != "sync" {
+		t.Fatalf("unexpected mode argument: %q", parsed["mode"])
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

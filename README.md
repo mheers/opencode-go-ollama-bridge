@@ -163,6 +163,20 @@ make lint
 make build
 ```
 
+## Model compatibility
+
+The bridge normalises non-standard tool-call markup back to the OpenAI `tool_calls` format before sending the response downstream.
+
+| Provider / model family | Tool-call format detected | Notes |
+|-------------------------|---------------------------|-------|
+| **MiniMax** (`minimax-m2.*`, `mimo-*`) | `]<]minimax[>[<tool_call>…</tool_call>` wrapper, `<invoke name="…">` / `<parameter=…>` / `<function …>` tags | Bridge forces `stream=false` upstream, repairs the response, then re-emits as SSE |
+| **Qwen3** (`qwen3.*`) | Standard OpenAI `tool_calls` JSON | No rewriting needed |
+| **DeepSeek** (`deepseek-*`) | DSML format: `<｜｜DSML｜｜tool_calls>` / `<｜｜DSML｜｜invoke name="…">` / `<｜｜DSML｜｜parameter name="…">` | Bridge parses DSML blocks and converts to OpenAI tool_calls |
+| **GLM** (`glm-*`) | Standard OpenAI `tool_calls` JSON | No rewriting needed |
+| **Kimi** (`kimi-*`) | Standard OpenAI `tool_calls` JSON | No rewriting needed |
+
+If you discover a model that produces a different non-standard format, open an issue or PR — adding support requires a new regex pattern and a small parser in `internal/handler/handler.go`.
+
 ## License
 
 [MIT](LICENSE)
