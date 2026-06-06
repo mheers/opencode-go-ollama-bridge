@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -2092,10 +2093,19 @@ func rewriteBufferedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.F
 						if !ok {
 							continue
 						}
-						tcs, ok := st.toolCalls[tcIdx]
+
+						storedIndex := tcIdx
+						switch v := tcm["index"].(type) {
+						case float64:
+							storedIndex = int(v)
+						case int:
+							storedIndex = v
+						}
+
+						tcs, ok := st.toolCalls[storedIndex]
 						if !ok {
 							tcs = &toolCallState{}
-							st.toolCalls[tcIdx] = tcs
+							st.toolCalls[storedIndex] = tcs
 						}
 						if id, ok := tcm["id"].(string); ok && id != "" {
 							tcs.id = id
@@ -2154,8 +2164,13 @@ func rewriteBufferedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.F
 
 		if len(st.toolCalls) > 0 {
 			fromUpstream := make([]map[string]interface{}, 0, len(st.toolCalls))
-			for i := 0; i < len(st.toolCalls); i++ {
-				tc, ok := st.toolCalls[i]
+			tcKeys := make([]int, 0, len(st.toolCalls))
+			for k := range st.toolCalls {
+				tcKeys = append(tcKeys, k)
+			}
+			sort.Ints(tcKeys)
+			for i, k := range tcKeys {
+				tc, ok := st.toolCalls[k]
 				if !ok {
 					continue
 				}
@@ -2258,7 +2273,8 @@ func writeOpenAIStreamFromResponse(w io.Writer, repairedBody []byte, fallbackMod
 		model = fallbackModel
 	}
 
-	for i, choice := range resp.Choices {
+	for _, choice := range resp.Choices {
+		choiceIndex := choice.Index
 		content := ""
 		var toolCalls []adapter.OpenAIToolCall
 		if choice.Message != nil {
@@ -2277,7 +2293,7 @@ func writeOpenAIStreamFromResponse(w io.Writer, repairedBody []byte, fallbackMod
 				"model":   model,
 				"choices": []map[string]interface{}{
 					{
-						"index": i,
+						"index": choiceIndex,
 						"delta": map[string]interface{}{
 							"role":    "assistant",
 							"content": content,
@@ -2298,9 +2314,9 @@ func writeOpenAIStreamFromResponse(w io.Writer, repairedBody []byte, fallbackMod
 
 		if len(toolCalls) > 0 {
 			deltaToolCalls := make([]map[string]interface{}, 0, len(toolCalls))
-			for idx, tc := range toolCalls {
+			for tcIdx, tc := range toolCalls {
 				deltaToolCalls = append(deltaToolCalls, map[string]interface{}{
-					"index": idx,
+					"index": tcIdx,
 					"id":    tc.ID,
 					"type":  tc.Type,
 					"function": map[string]interface{}{
@@ -2317,7 +2333,7 @@ func writeOpenAIStreamFromResponse(w io.Writer, repairedBody []byte, fallbackMod
 				"model":   model,
 				"choices": []map[string]interface{}{
 					{
-						"index": i,
+						"index": choiceIndex,
 						"delta": map[string]interface{}{
 							"role":       "assistant",
 							"tool_calls": deltaToolCalls,
@@ -2337,37 +2353,60 @@ func writeOpenAIStreamFromResponse(w io.Writer, repairedBody []byte, fallbackMod
 		}
 	}
 
-	finishReason := "stop"
-	if len(resp.Choices) > 0 {
-		if resp.Choices[0].FinishReason != nil && *resp.Choices[0].FinishReason != "" {
-			finishReason = *resp.Choices[0].FinishReason
-		} else if resp.Choices[0].Message != nil && len(resp.Choices[0].Message.ToolCalls) > 0 {
-			finishReason = "tool_calls"
+	if len(resp.Choices) == 0 {
+		finalChunk := map[string]interface{}{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]interface{}{
+				{
+					"index":         0,
+					"delta":         map[string]interface{}{},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		data, err := json.Marshal(finalChunk)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return err
+		}
+	} else {
+		for _, choice := range resp.Choices {
+			finishReason := "stop"
+			if choice.FinishReason != nil && *choice.FinishReason != "" {
+				finishReason = *choice.FinishReason
+			} else if choice.Message != nil && len(choice.Message.ToolCalls) > 0 {
+				finishReason = "tool_calls"
+			}
+
+			finalChunk := map[string]interface{}{
+				"id":      id,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []map[string]interface{}{
+					{
+						"index":         choice.Index,
+						"delta":         map[string]interface{}{},
+						"finish_reason": finishReason,
+					},
+				},
+			}
+			data, err := json.Marshal(finalChunk)
+			if err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+				return err
+			}
 		}
 	}
 
-	finalChunk := map[string]interface{}{
-		"id":      id,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   model,
-		"choices": []map[string]interface{}{
-			{
-				"index":         0,
-				"delta":         map[string]interface{}{},
-				"finish_reason": finishReason,
-			},
-		},
-	}
-	data, err := json.Marshal(finalChunk)
-	if err != nil {
-		return err
-	}
-	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
-		return err
-	}
-
-	_, err = io.WriteString(w, "data: [DONE]\n\n")
+	_, err := io.WriteString(w, "data: [DONE]\n\n")
 	return err
 }
 

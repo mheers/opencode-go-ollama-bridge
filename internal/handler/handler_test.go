@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/mheers/opencode-go-ollama-bridge/internal/adapter"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/redact"
 )
@@ -1042,6 +1044,98 @@ func TestV1ChatCompletions_OpenAI_StreamPreservesNativeToolCalls(t *testing.T) {
 	}
 	if strings.Contains(bodyOut, `"name":"cd"`) || strings.Contains(bodyOut, `"name":"git"`) {
 		t.Fatalf("unexpected fake tool names should not be emitted: %s", bodyOut)
+	}
+}
+
+func TestV1ChatCompletions_OpenAI_StreamPreservesSparseNativeToolCallIndex(t *testing.T) {
+	upstream := "data: {\"id\":\"chatcmpl-sparse\",\"object\":\"chat.completion.chunk\",\"created\":11,\"model\":\"qwen3.7-plus\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":3,\"id\":\"call_sparse\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"\"}}],\"content\":\"\"},\"finish_reason\":null}]}\n\n" +
+		"data: {\"id\":\"chatcmpl-sparse\",\"object\":\"chat.completion.chunk\",\"created\":11,\"model\":\"qwen3.7-plus\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":3,\"function\":{\"arguments\":\"{\\\"filePath\\\":\\\"/tmp/demo/go.mod\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+
+	h := newOpenAIV1Handler(t, upstream, true)
+	body := `{"model":"qwen3.7-plus","messages":[{"role":"user","content":"read go.mod"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if !strings.Contains(bodyOut, `"name":"read_file"`) {
+		t.Fatalf("expected sparse-index tool call name to be preserved: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `/tmp/demo/go.mod`) {
+		t.Fatalf("expected sparse-index tool call arguments to be preserved: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected finish_reason tool_calls in rewritten stream: %s", bodyOut)
+	}
+	if strings.Contains(bodyOut, `"arguments":"{}"`) {
+		t.Fatalf("sparse-index tool call should not be dropped to empty args: %s", bodyOut)
+	}
+}
+
+func TestWriteOpenAIStreamFromResponse_EmitsPerChoiceFinishChunks(t *testing.T) {
+	frStop := "stop"
+	frTools := "tool_calls"
+	repaired := adapter.OpenAIResponse{
+		ID:      "chatcmpl-multi",
+		Object:  "chat.completion",
+		Created: 12,
+		Model:   "qwen3.7-plus",
+		Choices: []adapter.OpenAIChoice{
+			{
+				Index: 0,
+				Message: &adapter.OpenAIMessageResp{
+					Role:    "assistant",
+					Content: "first",
+				},
+				FinishReason: &frStop,
+			},
+			{
+				Index: 1,
+				Message: &adapter.OpenAIMessageResp{
+					Role:    "assistant",
+					Content: "second",
+					ToolCalls: []adapter.OpenAIToolCall{{
+						ID:   "call_1",
+						Type: "function",
+						Function: adapter.OpenAIToolFunction{
+							Name:      "read_file",
+							Arguments: `{"filePath":"main.go"}`,
+						},
+					}},
+				},
+				FinishReason: &frTools,
+			},
+		},
+	}
+
+	body, err := json.Marshal(repaired)
+	if err != nil {
+		t.Fatalf("marshal repaired response: %v", err)
+	}
+
+	var out bytes.Buffer
+	if err := writeOpenAIStreamFromResponse(&out, body, "qwen3.7-plus"); err != nil {
+		t.Fatalf("writeOpenAIStreamFromResponse: %v", err)
+	}
+
+	bodyOut := out.String()
+	if !strings.Contains(bodyOut, `"index":0`) || !strings.Contains(bodyOut, `"index":1`) {
+		t.Fatalf("expected SSE output for both choice indices: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"finish_reason":"stop","index":0`) {
+		t.Fatalf("expected final stop chunk for choice index 0: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"finish_reason":"tool_calls","index":1`) {
+		t.Fatalf("expected final tool_calls chunk for choice index 1: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, "data: [DONE]") {
+		t.Fatalf("expected DONE marker in SSE output: %s", bodyOut)
 	}
 }
 
