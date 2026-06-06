@@ -43,10 +43,22 @@ var (
 
 	// <tool_calls>…</tool_calls> (plural, no word-boundary) — used by hy3-preview
 	// and possibly others routing via OpenRouter. May contain JSON, invoke-style
-	// sub-tags, or be completely empty.
+	// sub-tags, <tool_call>name style lines, or be completely empty.
 	toolCallsPluralInnerRE = regexp.MustCompile(`(?is)<tool_calls>(.*?)</tool_calls>`)
 	toolCallsPluralBlockRE = regexp.MustCompile(`(?is)<tool_calls>.*?</tool_calls>`)
 	toolCallsPluralTailRE  = regexp.MustCompile(`(?is)<tool_calls>.*$`)
+
+	// Matches a single <tool_call>…</tool_call> segment. The body may be empty
+	// (just a name) or contain optional JSON arguments.
+	// Used for the hy3-preview nested format inside <tool_calls>.
+	toolCallNameSegmentRE = regexp.MustCompile(`(?is)<tool_call>(.*?)(?:</tool_call>|$)`)
+
+	// Matches any XML/HTML tag, used to strip stray tags (e.g. </arg_value>)
+	// from extracted tool names.
+	xmlTagRE = regexp.MustCompile(`<[^>]+>`)
+
+	// <arg_key>name</arg_key> <arg_value>value</arg_value> — hy3-preview argument format.
+	argPairRE = regexp.MustCompile(`(?is)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>`)
 )
 
 type Handler struct {
@@ -70,7 +82,7 @@ func (h *Handler) logBody(tag string, body []byte) {
 		return
 	}
 
-	const maxLogBytes = 20000
+	const maxLogBytes = 60000
 	if len(body) <= maxLogBytes {
 		h.logf("%s %s", tag, string(body))
 		return
@@ -386,7 +398,7 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 			h.logBody("[V1/CHAT] upstream raw stream body:", rawSSE)
 			w.WriteHeader(http.StatusOK)
 
-			repairedBody, err := rewriteBufferedOpenAISSE(bytes.NewReader(rawSSE), w, flusher, modelID)
+			repairedBody, err := rewriteBufferedOpenAISSE(bytes.NewReader(rawSSE), w, flusher, modelID, h.logf)
 			if err != nil {
 				h.logf("[V1/CHAT] stream sanitize error: %v", err)
 				return
@@ -495,11 +507,11 @@ func anthropicBodyToOpenAIJSON(raw []byte, model string) ([]byte, error) {
 		ID         string `json:"id"`
 		StopReason string `json:"stop_reason"`
 		Content    []struct {
-			Type     string          `json:"type"`
-			Text     string          `json:"text,omitempty"`
-			ID       string          `json:"id,omitempty"`
-			Name     string          `json:"name,omitempty"`
-			Input    json.RawMessage `json:"input,omitempty"`
+			Type  string          `json:"type"`
+			Text  string          `json:"text,omitempty"`
+			ID    string          `json:"id,omitempty"`
+			Name  string          `json:"name,omitempty"`
+			Input json.RawMessage `json:"input,omitempty"`
 		} `json:"content"`
 		Usage struct {
 			InputTokens  int `json:"input_tokens"`
@@ -531,7 +543,7 @@ func anthropicBodyToOpenAIJSON(raw []byte, model string) ([]byte, error) {
 					Arguments: argsStr,
 				},
 			})
-		// "thinking" and "thinking" blocks are intentionally skipped
+			// "thinking" and "thinking" blocks are intentionally skipped
 		}
 	}
 
@@ -807,6 +819,75 @@ func parseTaggedAssistantContent(content string) (string, []map[string]interface
 	return clean, toolCalls
 }
 
+// pluralSingleObjectToTC converts a single JSON object (from inside a
+// <tool_calls> block) to an OpenAI-shaped tool-call map.  Returns nil if the
+// object cannot be identified as a valid tool call.
+func pluralSingleObjectToTC(obj map[string]interface{}, idx int) map[string]interface{} {
+	name := ""
+	argsRaw := interface{}(nil)
+
+	// OpenAI-nested: {"type":"function","function":{"name":"fn","arguments":"..."}}
+	if fn, ok := obj["function"].(map[string]interface{}); ok {
+		name, _ = fn["name"].(string)
+		argsRaw = fn["arguments"]
+	}
+
+	// Simple: {"name":"fn","arguments":{...}} or {"name":"fn","parameters":{...}}
+	if name == "" {
+		name, _ = obj["name"].(string)
+		if argsRaw == nil {
+			if a, ok := obj["arguments"]; ok {
+				argsRaw = a
+			} else if p, ok := obj["parameters"]; ok {
+				argsRaw = p
+			}
+		}
+	}
+
+	// tool_name / tool_input style (Anthropic-like)
+	if name == "" {
+		if tn, ok := obj["tool_name"].(string); ok {
+			name = tn
+			if ti, ok := obj["tool_input"]; ok {
+				argsRaw = ti
+			}
+		}
+	}
+
+	if name == "" {
+		return nil
+	}
+
+	argsJSON := "{}"
+	if argsRaw != nil {
+		switch v := argsRaw.(type) {
+		case string:
+			if json.Valid([]byte(v)) {
+				argsJSON = v
+			} else if b, err := json.Marshal(v); err == nil {
+				argsJSON = string(b)
+			}
+		default:
+			if b, err := json.Marshal(v); err == nil {
+				argsJSON = string(b)
+			}
+		}
+	}
+
+	id := fmt.Sprintf("call_%d", idx)
+	if rawID, ok := obj["id"].(string); ok && rawID != "" {
+		id = rawID
+	}
+	return map[string]interface{}{
+		"id":   id,
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      name,
+			"arguments": argsJSON,
+		},
+	}
+}
+
 // extractPluralToolCalls handles the <tool_calls>…</tool_calls> (plural) format
 // used by hy3-preview and other models routed via OpenRouter.
 //
@@ -881,7 +962,22 @@ func extractPluralToolCalls(raw string) []map[string]interface{} {
 			continue
 		}
 
+		// Try a single JSON object (no array wrapper).
+		// Models sometimes emit <tool_calls>{"name":"fn","arguments":{...}}</tool_calls>
+		// or the OpenAI-nested form {"type":"function","function":{"name":"fn",...}}.
+		{
+			var obj map[string]interface{}
+			if err := json.NewDecoder(strings.NewReader(inner)).Decode(&obj); err == nil {
+				if tc := pluralSingleObjectToTC(obj, callIdx); tc != nil {
+					out = append(out, tc)
+					callIdx++
+					continue
+				}
+			}
+		}
+
 		// Fall back to invoke-style sub-tags (same as minimax handler).
+		invokeMatched := false
 		for _, im := range invokeTagRE.FindAllStringSubmatch(inner, -1) {
 			if len(im) < 3 {
 				continue
@@ -890,6 +986,7 @@ func extractPluralToolCalls(raw string) []map[string]interface{} {
 			if !bareCallNameRE.MatchString(strings.ToLower(name)) {
 				continue
 			}
+			invokeMatched = true
 			params := map[string]string{}
 			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
 				params["command"] = strings.TrimSpace(cm[1])
@@ -916,12 +1013,139 @@ func extractPluralToolCalls(raw string) []map[string]interface{} {
 			})
 			callIdx++
 		}
+		if invokeMatched {
+			continue
+		}
+
+		// Handle hy3-preview format: <tool_call>name\n{optional_json}</tool_call>
+		// Multiple calls may be present with each name on the line after <tool_call>.
+		// The closing </tool_call> may be absent for all but the last.
+		// Strategy: split inner content on <tool_call> to get one segment per call.
+		if strings.Contains(inner, "<tool_call>") {
+			// Split on <tool_call> (case-insensitive equivalent via strings.Split on lowercased positions).
+			// We rebuild by splitting the original inner on the literal "<tool_call>".
+			parts := splitOnToolCallTag(inner)
+			for _, seg := range parts {
+				// Each segment is the content after one <tool_call> opener.
+				// Strip any trailing </tool_call> or </tool_calls>.
+				seg = strings.TrimSpace(seg)
+				seg = stripTrailingCloseTags(seg)
+				seg = strings.TrimSpace(seg)
+				if seg == "" {
+					continue
+				}
+				// Extract tool name: first word before any whitespace or XML tag opener.
+				// This handles both:
+				//   <tool_call>read_file\n{json}  (name on own line, json follows)
+				//   <tool_call>run_in_terminal <arg_key>command</arg_key> <arg_value>...</arg_value>
+				nameEnd := strings.IndexAny(seg, " \t\n<")
+				var name, rest string
+				if nameEnd < 0 {
+					name = strings.TrimSpace(seg)
+					rest = ""
+				} else {
+					name = strings.TrimSpace(seg[:nameEnd])
+					rest = strings.TrimSpace(seg[nameEnd:])
+				}
+				// Strip any remaining XML tags from name for safety.
+				name = strings.TrimSpace(xmlTagRE.ReplaceAllString(name, ""))
+				// Must be a valid tool name; reject garbage.
+				if name == "" || !bareCallNameRE.MatchString(strings.ToLower(name)) {
+					continue
+				}
+				argsJSON := "{}"
+				// Try <arg_key>k</arg_key> <arg_value>v</arg_value> pair format.
+				if argPairRE.MatchString(rest) {
+					params := map[string]string{}
+					for _, pm := range argPairRE.FindAllStringSubmatch(rest, -1) {
+						if len(pm) >= 3 {
+							k := strings.TrimSpace(pm[1])
+							v := strings.TrimSpace(pm[2])
+							if k != "" {
+								params[k] = v
+							}
+						}
+					}
+					if len(params) > 0 {
+						if b, err := json.Marshal(params); err == nil {
+							argsJSON = string(b)
+						}
+					}
+				} else if rest != "" {
+					// Fall back: the rest (after the name line) may be JSON.
+					argContent := rest
+					// If name was on its own line, rest is everything after the first \n.
+					if lines := strings.SplitN(seg, "\n", 2); len(lines) > 1 {
+						argContent = strings.TrimSpace(lines[1])
+					}
+					if argContent != "" && json.Valid([]byte(argContent)) {
+						argsJSON = argContent
+					}
+				}
+				out = append(out, map[string]interface{}{
+					"id":   fmt.Sprintf("call_%d", callIdx),
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": argsJSON,
+					},
+				})
+				callIdx++
+			}
+		}
 	}
 
 	if len(out) == 0 {
 		return nil
 	}
 	return out
+}
+
+// splitOnToolCallTag splits s on every occurrence of "<tool_call>" (case-insensitive)
+// and returns the segments that follow each opener (the first empty segment before
+// the first opener is dropped).
+func splitOnToolCallTag(s string) []string {
+	const open = "<tool_call>"
+	lower := strings.ToLower(s)
+	var parts []string
+	pos := 0
+	for {
+		idx := strings.Index(lower[pos:], open)
+		if idx < 0 {
+			break
+		}
+		abs := pos + idx + len(open)
+		pos = abs
+		// Collect until the next <tool_call> or end of string.
+		next := strings.Index(lower[abs:], open)
+		var seg string
+		if next < 0 {
+			seg = s[abs:]
+		} else {
+			seg = s[abs : abs+next]
+		}
+		parts = append(parts, seg)
+	}
+	return parts
+}
+
+// stripTrailingCloseTags removes </tool_call> and </tool_calls> suffixes from s.
+func stripTrailingCloseTags(s string) string {
+	for {
+		lower := strings.ToLower(s)
+		if strings.HasSuffix(lower, "</tool_call>") {
+			s = s[:len(s)-len("</tool_call>")]
+			s = strings.TrimRight(s, " \t\r\n")
+			continue
+		}
+		if strings.HasSuffix(lower, "</tool_calls>") {
+			s = s[:len(s)-len("</tool_calls>")]
+			s = strings.TrimRight(s, " \t\r\n")
+			continue
+		}
+		break
+	}
+	return s
 }
 
 // extractDSMLToolCalls handles DeepSeek's DSML markup format:
@@ -1291,7 +1515,7 @@ func proxySanitizedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.Fl
 	return scanner.Err()
 }
 
-func rewriteBufferedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.Flusher, fallbackModel string) ([]byte, error) {
+func rewriteBufferedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.Flusher, fallbackModel string, logf func(string, ...interface{})) ([]byte, error) {
 	type toolCallState struct {
 		id      string
 		typ     string
@@ -1474,6 +1698,19 @@ func rewriteBufferedOpenAISSE(reader io.Reader, writer io.Writer, flusher http.F
 
 	for _, idx := range order {
 		st := states[idx]
+
+		// Debug: log the accumulated content before tag extraction so we can see
+		// any un-extracted <tool_calls> markup when things go wrong.
+		if logf != nil {
+			rawContent := st.content.String()
+			snippet := rawContent
+			if len(snippet) > 500 {
+				snippet = snippet[:500] + "…"
+			}
+			logf("[SSE/REWRITE] choice[%d] native_tool_calls=%d accumulated_content(%d): %s",
+				idx, len(st.toolCalls), len(rawContent), snippet)
+		}
+
 		clean, tcs := parseTaggedAssistantContent(st.content.String())
 
 		if len(st.toolCalls) > 0 {

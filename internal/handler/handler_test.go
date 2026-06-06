@@ -473,6 +473,148 @@ func TestParseTaggedAssistantContent_PluralToolCallsInvokeStyle(t *testing.T) {
 	}
 }
 
+func TestParseTaggedAssistantContent_PluralToolCallsSingleObject(t *testing.T) {
+	// hy3-preview may emit a single JSON object (not an array) inside <tool_calls>.
+	in := `Let me read the file.<tool_calls>{"name":"read_file","arguments":{"path":"main.go"}}</tool_calls>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_calls>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if !strings.Contains(clean, "Let me read the file") {
+		t.Fatalf("visible text was eaten: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("unexpected tool name: %+v", fn)
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralToolCallsOpenAINested(t *testing.T) {
+	// OpenAI-nested format inside <tool_calls>: {"type":"function","function":{...}}
+	in := `<tool_calls>{"type":"function","function":{"name":"run_in_terminal","arguments":"{\"command\":\"go vet ./...\"}"}}</tool_calls>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %+v", fn)
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralNestedToolCallsNameOnly(t *testing.T) {
+	// hy3-preview exact format from real log:
+	// <tool_calls>\n<tool_call>read_file\n<tool_call>run_in_terminal\n</tool_call>\n</tool_calls>
+	in := "I'll read the Go file and then run the linter." +
+		"<tool_calls>\n<tool_call>read_file\n<tool_call>run_in_terminal\n</tool_call>\n</tool_calls>"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_calls>") || strings.Contains(clean, "<tool_call>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if !strings.Contains(clean, "I'll read the Go file") {
+		t.Fatalf("visible text was eaten: %q", clean)
+	}
+	if len(toolCalls) != 2 {
+		t.Fatalf("expected 2 tool calls, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	name0, _ := toolCalls[0]["function"].(map[string]interface{})
+	name1, _ := toolCalls[1]["function"].(map[string]interface{})
+	if name0["name"] != "read_file" {
+		t.Fatalf("expected read_file, got %q", name0["name"])
+	}
+	if name1["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %q", name1["name"])
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralNestedToolCallsWithArgs(t *testing.T) {
+	// <tool_call>name\n{json_args}</tool_call> format inside <tool_calls>.
+	in := "<tool_calls>\n<tool_call>read_file\n{\"filePath\":\"main.go\",\"startLine\":1,\"endLine\":50}</tool_call>\n</tool_calls>"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("unexpected tool name: %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "main.go" {
+		t.Fatalf("unexpected filePath: %v", parsed["filePath"])
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralNestedToolCallJunkTags(t *testing.T) {
+	// Real observed format: model appends </arg_value> on the same line as the name.
+	// <tool_calls>\n<tool_call>read_file</arg_value>\n</tool_call>\n</tool_calls>
+	in := "I'll read the Go file and then run the linter." +
+		"<tool_calls>\n<tool_call>read_file</arg_value>\n</tool_call>\n</tool_calls>"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_calls>") || strings.Contains(clean, "<tool_call>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("expected read_file (without junk tags), got %q", fn["name"])
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralNestedArgKeyValueFormat(t *testing.T) {
+	// hy3-preview exact format: name and args on same line using <arg_key>/<arg_value> pairs.
+	in := "I'll count the lines using the terminal." +
+		"<tool_calls>\n<tool_call>run_in_terminal " +
+		"<arg_key>command</arg_key> <arg_value>wc -l /tmp/demo/* 2>/dev/null</arg_value> " +
+		"<arg_key>explanation</arg_key> <arg_value>Count lines in all files</arg_value>" +
+		"</tool_call>\n</tool_calls>"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_calls>") || strings.Contains(clean, "<arg_key>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if !strings.Contains(clean, "I'll count the lines") {
+		t.Fatalf("visible text was eaten: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["command"] != "wc -l /tmp/demo/* 2>/dev/null" {
+		t.Fatalf("unexpected command: %q", parsed["command"])
+	}
+	if parsed["explanation"] != "Count lines in all files" {
+		t.Fatalf("unexpected explanation: %q", parsed["explanation"])
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
