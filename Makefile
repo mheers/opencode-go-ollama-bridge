@@ -1,4 +1,4 @@
-.PHONY: build test lint clean docker-build probe probe-stream probe-json probe-multi probe-single
+.PHONY: build test lint clean docker-build probe probe-stream probe-json probe-multi probe-single probe-bridge
 
 BINARY_NAME=opencode-go-ollama-bridge
 DOCKER_IMAGE=opencode-go-ollama-bridge
@@ -34,6 +34,10 @@ probe-single:
 # probe-multi: run both single-turn and multi-turn probes.
 probe-multi:
 	go run ./cmd/probe
+
+# probe-bridge: full probe including bridge validation round (bridge must be running on :11433).
+probe-bridge:
+	go run ./cmd/probe --bridge-url http://localhost:11433/v1
 
 lint:
 	go vet ./...

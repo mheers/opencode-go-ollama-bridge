@@ -1,11 +1,13 @@
 // probe is a diagnostic tool that sends standardised tool-calling requests to
 // every available model on the upstream OpenCode Go API and prints the raw
-// responses.  It runs two rounds per model:
+// responses.  It runs up to three rounds per model:
 //
-//  1. Single-turn: bare tool-call request (tells us the basic format).
+//  1. Single-turn: bare tool-call request to upstream (tells us the raw format).
 //  2. Multi-turn:  injects a fake tool result and asks the model to continue
-//     (reveals how models behave in a real agentic conversation where they have
-//     already called a tool once).
+//     (reveals how models behave in a real agentic conversation).
+//  3. Bridge round: same as round 1 but routed through the local bridge at
+//     --bridge-url. Validates that the bridge correctly parses and surfaces
+//     tool_calls regardless of the upstream's markup format.
 //
 // Results are saved to probe-results/<model>.<turn>.<backend>.json.
 //
@@ -31,6 +33,7 @@ import (
 
 var (
 	flagBaseURL    string
+	flagBridgeURL  string
 	flagAPIKey     string
 	flagModels     string
 	flagStream     bool
@@ -48,6 +51,7 @@ func main() {
 	}
 
 	root.Flags().StringVar(&flagBaseURL, "base-url", envOrDefault("OPENCODE_GO_BASE_URL", "https://opencode.ai/zen/go/v1"), "Upstream API base URL")
+	root.Flags().StringVar(&flagBridgeURL, "bridge-url", envOrDefault("OLLAMA_BRIDGE_URL", "http://localhost:11433/v1"), "Local bridge URL for round-3 validation (empty to skip)")
 	root.Flags().StringVar(&flagAPIKey, "api-key", os.Getenv("OPENCODE_GO_API_KEY"), "API key (or set OPENCODE_GO_API_KEY)")
 	root.Flags().StringVar(&flagModels, "models", "", "Comma-separated model IDs to probe (default: all from /models)")
 	root.Flags().BoolVar(&flagStream, "stream", false, "Use streaming mode (SSE)")
@@ -85,10 +89,13 @@ func run(_ *cobra.Command, _ []string) error {
 		duration    time.Duration
 		single      modelSummary
 		multiTurn   modelSummary
+		bridgeRound modelSummary
 		singleRaw   []byte
 		multiRaw    []byte
+		bridgeRaw   []byte
 		singleErr   error
 		multiErr    error
+		bridgeErr   error
 	}
 	results := make([]result, 0, len(models))
 
@@ -144,17 +151,50 @@ func run(_ *cobra.Command, _ []string) error {
 			fmt.Printf("\n--- RAW (round 2) ---\n%s\n", indentJSON(r.multiRaw))
 		}
 
+		// ── Round 3: bridge validation ────────────────────────────────────────
+		// Route the same single-turn request through the local bridge and verify
+		// that tool_calls come out correctly parsed — name is clean, args are
+		// valid JSON, finish_reason is "tool_calls".
+		if flagBridgeURL != "" {
+			bridgeURL := strings.TrimRight(flagBridgeURL, "/")
+			fmt.Printf("  [round 3] bridge validation (%s)…\n", bridgeURL)
+			start = time.Now()
+			r.bridgeRaw, r.bridgeRound, r.bridgeErr = probeBridge(bridgeURL, model)
+			r.duration += time.Since(start)
+			if r.bridgeErr != nil {
+				fmt.Printf("   ERROR (round 3): %v\n", r.bridgeErr)
+			} else {
+				printSummary("bridge", r.bridgeRound)
+				saveResult(model, "bridge", "bridge", r.bridgeRaw)
+				// Detailed validation output.
+				if !r.bridgeRound.hasToolCalls {
+					fmt.Printf("  [bridge] ⚠  NO TOOL CALLS extracted — bridge failed to parse model markup!\n")
+				} else {
+					for _, issue := range r.bridgeRound.issues {
+						fmt.Printf("  [bridge] ⚠  %s\n", issue)
+					}
+					if len(r.bridgeRound.issues) == 0 {
+						fmt.Printf("  [bridge] ✓  tool_calls correctly extracted\n")
+					}
+				}
+			}
+			if flagOutputJSON && len(r.bridgeRaw) > 0 {
+				fmt.Printf("\n--- RAW (round 3 bridge) ---\n%s\n", indentJSON(r.bridgeRaw))
+			}
+		}
+
 		results = append(results, r)
 	}
 
 	// ── Compatibility table ───────────────────────────────────────────────────
 	fmt.Printf("\n%s\n  COMPATIBILITY TABLE\n%s\n", sep, sep)
-	fmt.Printf("%-28s  %-9s  %-22s  %-22s\n", "MODEL", "BACKEND", "ROUND-1 FORMAT", "ROUND-2 FORMAT")
-	fmt.Printf("%-28s  %-9s  %-22s  %-22s\n",
-		strings.Repeat("-", 28), strings.Repeat("-", 9), strings.Repeat("-", 22), strings.Repeat("-", 22))
+	fmt.Printf("%-28s  %-9s  %-22s  %-22s  %-22s\n", "MODEL", "BACKEND", "ROUND-1 FORMAT", "ROUND-2 FORMAT", "BRIDGE")
+	fmt.Printf("%-28s  %-9s  %-22s  %-22s  %-22s\n",
+		strings.Repeat("-", 28), strings.Repeat("-", 9), strings.Repeat("-", 22), strings.Repeat("-", 22), strings.Repeat("-", 22))
 	for _, r := range results {
 		r1fmt := "ERROR"
 		r2fmt := "(skipped)"
+		brFmt := "(skipped)"
 		if r.singleErr == nil {
 			r1fmt = r.single.formatTag
 		}
@@ -163,7 +203,18 @@ func run(_ *cobra.Command, _ []string) error {
 		} else if r.multiErr != nil {
 			r2fmt = "ERROR"
 		}
-		fmt.Printf("%-28s  %-9s  %-22s  %-22s\n", r.model, r.backend, truncate(r1fmt, 22), truncate(r2fmt, 22))
+		if flagBridgeURL != "" {
+			if r.bridgeErr != nil {
+				brFmt = "ERROR"
+			} else if !r.bridgeRound.hasToolCalls {
+				brFmt = "✗ no tool_calls"
+			} else if len(r.bridgeRound.issues) > 0 {
+				brFmt = "⚠ " + r.bridgeRound.issues[0]
+			} else {
+				brFmt = "✓ tool_calls ok"
+			}
+		}
+		fmt.Printf("%-28s  %-9s  %-22s  %-22s  %-22s\n", r.model, r.backend, truncate(r1fmt, 22), truncate(r2fmt, 22), truncate(brFmt, 22))
 	}
 	fmt.Println()
 	return nil
@@ -241,6 +292,7 @@ type modelSummary struct {
 	formatTag    string
 	contentSnip  string
 	toolNames    []string
+	issues       []string // populated by bridge validation
 }
 
 func isOACompatError(err error) bool {
@@ -306,7 +358,7 @@ func probeMultiTurn(baseURL, model string, calledTools []string) ([]byte, modelS
 	messages := []map[string]interface{}{
 		{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
 		{
-			"role": "assistant",
+			"role":    "assistant",
 			"content": nil,
 			"tool_calls": []map[string]interface{}{
 				{
@@ -475,6 +527,119 @@ func probeMultiTurnAnthropic(baseURL, model string, calledTools []string) ([]byt
 // ─────────────────────────────────────────────────────────────────────────────
 // Request builders
 // ─────────────────────────────────────────────────────────────────────────────
+
+// probeBridge sends a single-turn tool-call request through the local bridge
+// (bridgeURL is e.g. http://localhost:11433/v1) and validates that the bridge
+// correctly extracts and emits tool_calls in the OpenAI response format.
+// The bridge will normalise whatever markup the model produces; this round
+// checks the final output after that normalisation.
+func probeBridge(bridgeURL, model string) ([]byte, modelSummary, error) {
+	// The bridge itself holds the API key; we just need to authenticate with it.
+	raw, code, err := doPost(bridgeURL+"/chat/completions",
+		map[string]string{"Authorization": "Bearer " + flagAPIKey},
+		buildProbeRequest(model, false)) // non-streaming for easy JSON validation
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+	if code >= 400 {
+		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", code, truncate(string(raw), 200))
+	}
+	return raw, analyseBridgeJSON(raw), nil
+}
+
+// analyseBridgeJSON parses a bridge OpenAI JSON response and validates:
+// - choices[0].message.tool_calls exists and is non-empty
+// - each tool call has a non-empty, valid name (no XML tags)
+// - each tool call has valid JSON arguments
+// - finish_reason is "tool_calls"
+// Issues are reported in summary.issues.
+func analyseBridgeJSON(raw []byte) modelSummary {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return modelSummary{formatTag: "invalid JSON", issues: []string{"cannot parse response JSON: " + err.Error()}}
+	}
+
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) == 0 {
+		return modelSummary{formatTag: "no choices", issues: []string{"response has no choices"}}
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	msg, _ := choice["message"].(map[string]interface{})
+	if msg == nil {
+		return modelSummary{formatTag: "no message", issues: []string{"choice[0] has no message"}}
+	}
+
+	summary := modelSummary{}
+	var issueList []string
+
+	// Validate finish_reason.
+	finishReason, _ := choice["finish_reason"].(string)
+	tcs, hasTCs := msg["tool_calls"].([]interface{})
+	if hasTCs && len(tcs) > 0 {
+		summary.hasToolCalls = true
+		if finishReason != "tool_calls" {
+			issueList = append(issueList, fmt.Sprintf("finish_reason=%q (expected \"tool_calls\")", finishReason))
+		}
+		for i, tc := range tcs {
+			tcm, ok := tc.(map[string]interface{})
+			if !ok {
+				issueList = append(issueList, fmt.Sprintf("tool_calls[%d]: not an object", i))
+				continue
+			}
+			fn, _ := tcm["function"].(map[string]interface{})
+			if fn == nil {
+				issueList = append(issueList, fmt.Sprintf("tool_calls[%d]: missing function field", i))
+				continue
+			}
+			name, _ := fn["name"].(string)
+			if name == "" {
+				issueList = append(issueList, fmt.Sprintf("tool_calls[%d]: empty name", i))
+			} else if containsXMLTag(name) {
+				issueList = append(issueList, fmt.Sprintf("tool_calls[%d]: name contains XML junk: %q", i, name))
+			} else {
+				summary.toolNames = append(summary.toolNames, name)
+			}
+			args, _ := fn["arguments"].(string)
+			if args == "" {
+				// empty string arguments are sometimes valid (no-arg tools)
+			} else if !json.Valid([]byte(args)) {
+				issueList = append(issueList, fmt.Sprintf("tool_calls[%d]: arguments is not valid JSON: %q", i, truncate(args, 80)))
+			}
+		}
+	} else {
+		// Check if content has leftover markup that wasn't extracted.
+		content := ""
+		switch v := msg["content"].(type) {
+		case string:
+			content = v
+		}
+		if containsToolMarkup(content) {
+			issueList = append(issueList, "tool markup found in content but no tool_calls extracted: "+truncate(content, 120))
+		} else {
+			issueList = append(issueList, "no tool_calls in response (finish_reason="+finishReason+")")
+		}
+	}
+
+	if len(issueList) == 0 {
+		summary.formatTag = "✓ tool_calls ok"
+	} else {
+		summary.formatTag = "✗ " + issueList[0]
+	}
+	summary.issues = issueList
+	return summary
+}
+
+// containsXMLTag returns true if s contains something that looks like an XML tag.
+func containsXMLTag(s string) bool {
+	return strings.ContainsAny(s, "<>")
+}
+
+// containsToolMarkup detects un-extracted tool call markup in content.
+func containsToolMarkup(s string) bool {
+	return strings.Contains(s, "<tool_call") ||
+		strings.Contains(s, "<tool_calls") ||
+		strings.Contains(s, "｜｜DSML｜｜tool_calls")
+}
 
 func buildProbeRequest(model string, stream bool) map[string]interface{} {
 	return buildProbeRequestWithMessages(model,
@@ -807,6 +972,9 @@ func printSummary(label string, s modelSummary) {
 	}
 	if s.contentSnip != "" {
 		fmt.Printf("  [%s] content    : %s\n", label, s.contentSnip)
+	}
+	for _, issue := range s.issues {
+		fmt.Printf("  [%s] ⚠  %s\n", label, issue)
 	}
 }
 
