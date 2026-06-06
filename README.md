@@ -61,6 +61,8 @@ All settings can be provided via **environment variables** or **CLI flags** (fla
 | `OLLAMA_BRIDGE_VERSION`   | `--version` / `-v`| `0.24.0`                            | Ollama version string reported to clients     |
 | *(none)*                  | `--port` / `-p`   | *(overridden by `--listen`)*        | Short-form port only, e.g. `11434`            |
 | *(none)*                  | `--debug` / `-d`  | `false`                             | Log all requests and responses to stdout      |
+| `OLLAMA_BRIDGE_REDACT_SECRETS` | *(none)*     | `false`           | Run gitleaks over request bodies before forwarding upstream |
+| `OLLAMA_BRIDGE_REDACT_MODE`    | *(none)*     | `hide`            | Redaction mode: `hide` replaces with `[REDACTED:<rule>:<hash>]`, `drop` removes the whole line |
 
 ## Usage
 
@@ -111,8 +113,21 @@ Flags:
   -l, --listen string     Listen address e.g. :11434 or 0.0.0.0:11434 (also set via OLLAMA_BRIDGE_LISTEN env)
   -p, --port string       Listen port e.g. 11434 (overridden by --listen)
   -v, --version string    Ollama version to report (also set via OLLAMA_BRIDGE_VERSION env, default 0.6.4)
+      --redact-secrets    Run gitleaks over request bodies before forwarding upstream (also set via OLLAMA_BRIDGE_REDACT_SECRETS env)
+      --redact-mode string Redaction mode: "hide" (default) replaces secrets with placeholders, "drop" removes the whole line (also set via OLLAMA_BRIDGE_REDACT_MODE env)
   -h, --help              help for bridge
 ```
+
+### Secret redaction
+
+Pass `--redact-secrets` (or set `OLLAMA_BRIDGE_REDACT_SECRETS=true`) to run [gitleaks](https://github.com/gitleaks/gitleaks) over every request body before it is forwarded to the upstream OpenCode Go API. The detector runs in-process; the bridge never shells out to the gitleaks CLI.
+
+When redaction is enabled, request bodies are scanned for API keys, tokens, private keys, and similar patterns. `--redact-mode` (or `OLLAMA_BRIDGE_REDACT_MODE`) selects how matches are handled:
+
+- `hide` (default) — replaces each detected secret with a deterministic placeholder of the form `[REDACTED:<rule>:<short-hash>]`. The body stays valid JSON and the same secret always produces the same placeholder.
+- `drop` — removes the entire line containing the secret. Use this when you want the secret to disappear completely, at the cost of possibly breaking long string fields that span multiple lines.
+
+Redaction is best-effort: if the redactor itself errors, the bridge logs the error and forwards the original body unchanged so a misconfigured detector cannot break the proxy. Debug logging (`--debug`) also applies the redactor to request bodies before printing them.
 
 ## Connecting popular clients
 

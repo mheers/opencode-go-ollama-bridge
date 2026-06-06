@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
+	"github.com/mheers/opencode-go-ollama-bridge/internal/redact"
 )
 
 func newTestHandler() *Handler {
@@ -46,7 +47,7 @@ func newTestHandler() *Handler {
 		})
 	}))
 	c := client.New(srv.URL, "test-key")
-	return New(c, "0.24.0", false)
+	return New(c, "0.24.0", false, redact.NewNoop())
 }
 
 func TestVersionEndpoint(t *testing.T) {
@@ -727,6 +728,57 @@ func TestParseTaggedAssistantContent_MiniMaxInvokeMalformedAttr(t *testing.T) {
 	}
 }
 
+func TestParseTaggedAssistantContent_MiniMaxInvokeCollapsedIntoNameField(t *testing.T) {
+	// MiniMax-M3 occasionally collapses a single-argument tool call into a
+	// malformed invoke tag where the argument key/value is emitted in the name
+	// position and the body only contains a stray closing tag.
+	in := `]<]minimax[>[<tool_call>
+]<]minimax[>[<invoke name "filePath": "/home/marcel/workspace/heers/opencode-go-ollama-bridge/internal/redact/gitleaks.go"]<]minimax[>[</command>]<]minimax[>[</invoke>
+]<]minimax[>[</tool_call>`
+
+	_, toolCalls := parseTaggedAssistantContent(in)
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "read_file" {
+		t.Fatalf("expected read_file, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["filePath"] != "/home/marcel/workspace/heers/opencode-go-ollama-bridge/internal/redact/gitleaks.go" {
+		t.Fatalf("filePath wrong: %q", parsed["filePath"])
+	}
+}
+
+func TestParseTaggedAssistantContent_LooseToolTextKeepsLeadingContent(t *testing.T) {
+	hints := map[string]string{"semantic_search": "query"}
+	in := "Let me find all the `io.ReadAll(r.Body)` sites:\n\nsemantic_search\">\nSearch for all \"io.ReadAll(r.Body)\" invocations in handler.go\n\n</tool_call>"
+
+	clean, toolCalls := parseTaggedAssistantContentWithHints(in, hints)
+	if clean != "Let me find all the `io.ReadAll(r.Body)` sites:" {
+		t.Fatalf("clean content wrong: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "semantic_search" {
+		t.Fatalf("expected semantic_search, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["query"] != "Search for all \"io.ReadAll(r.Body)\" invocations in handler.go" {
+		t.Fatalf("query wrong: %q", parsed["query"])
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -753,7 +805,7 @@ func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Cleanup(srv.Close)
 
 	c := client.New(srv.URL, "test-key")
-	return New(c, "0.24.0", false)
+	return New(c, "0.24.0", false, redact.NewNoop())
 }
 
 func newMiniMaxV1Handler(t *testing.T, response string) *Handler {
@@ -778,7 +830,7 @@ func newMiniMaxV1Handler(t *testing.T, response string) *Handler {
 	t.Cleanup(srv.Close)
 
 	c := client.New(srv.URL, "test-key")
-	return New(c, "0.24.0", false)
+	return New(c, "0.24.0", false, redact.NewNoop())
 }
 
 func TestV1ChatCompletions_MiniMax_RepairsNonStreamingContent(t *testing.T) {
@@ -1069,4 +1121,159 @@ func TestV1ChatCompletions_MiniMaxM3_StreamBareObjectToolCalls(t *testing.T) {
 	if !strings.Contains(bodyOut, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("expected finish_reason tool_calls in rewritten stream: %s", bodyOut)
 	}
+}
+
+func TestV1ChatCompletions_MiniMax_LooseToolTextUsesRequestHints(t *testing.T) {
+	upstream := `{
+		"id":"mmx-loose-1",
+		"object":"chat.completion",
+		"created":1780750522,
+		"model":"MiniMax-M3",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"Let me find all the ` + "`io.ReadAll(r.Body)`" + ` sites:\n\nsemantic_search\">\nSearch for all \"io.ReadAll(r.Body)\" invocations in handler.go\n\n</tool_call>"
+			},
+			"finish_reason":"stop"
+		}]
+	}`
+
+	h := newMiniMaxV1Handler(t, upstream)
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"find the body reads"}],"tools":[{"type":"function","function":{"name":"semantic_search","parameters":{"type":"object","properties":{"query":{"type":"string"}},"required":["query"]}}}],"stream":false}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	var payload map[string]interface{}
+	if err := json.Unmarshal([]byte(bodyOut), &payload); err != nil {
+		t.Fatalf("invalid JSON response: %v (%s)", err, bodyOut)
+	}
+	choices, _ := payload["choices"].([]interface{})
+	if len(choices) != 1 {
+		t.Fatalf("expected 1 choice, got %d: %s", len(choices), bodyOut)
+	}
+	choice, _ := choices[0].(map[string]interface{})
+	if fr, _ := choice["finish_reason"].(string); fr != "tool_calls" {
+		t.Fatalf("expected finish_reason tool_calls, got %q: %s", fr, bodyOut)
+	}
+	msg, _ := choice["message"].(map[string]interface{})
+	if content, _ := msg["content"].(string); content != "Let me find all the `io.ReadAll(r.Body)` sites:" {
+		t.Fatalf("expected leading assistant content to be preserved, got %q", content)
+	}
+	toolCalls, _ := msg["tool_calls"].([]interface{})
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %s", len(toolCalls), bodyOut)
+	}
+	tc, _ := toolCalls[0].(map[string]interface{})
+	fn, _ := tc["function"].(map[string]interface{})
+	if fn["name"] != "semantic_search" {
+		t.Fatalf("expected semantic_search tool call, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments JSON: %v (%s)", err, args)
+	}
+	if parsed["query"] != "Search for all \"io.ReadAll(r.Body)\" invocations in handler.go" {
+		t.Fatalf("expected query argument, got %q", parsed["query"])
+	}
+}
+
+// newTestHandlerWithRedaction builds a handler whose upstream records the
+// raw request body it receives. The handler itself is configured with a
+// real gitleaks redactor in hide mode so we can assert that secrets
+// embedded in the client request never reach the upstream.
+func newTestHandlerWithRedaction(t *testing.T) (*Handler, *[]byte) {
+	t.Helper()
+	var captured []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			b, _ := io.ReadAll(r.Body)
+			r.Body.Close()
+			captured = b
+		}
+		// Reply with a minimal valid OpenAI-shape chat completion.
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{"message": map[string]interface{}{"role": "assistant", "content": "ok"}, "finish_reason": "stop"},
+			},
+			"usage": map[string]interface{}{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+		})
+	}))
+	t.Cleanup(upstream.Close)
+
+	redactor, err := redact.New(true, redact.ModeHide)
+	if err != nil {
+		t.Fatalf("redact.New: %v", err)
+	}
+	c := client.New(upstream.URL, "test-key")
+	return New(c, "0.24.0", false, redactor), &captured
+}
+
+func TestChatEndpoint_RedactsSecretBeforeUpstream(t *testing.T) {
+	h, captured := newTestHandlerWithRedaction(t)
+
+	// A clearly high-entropy OpenAI-style key that gitleaks flags by default.
+	const secret = "ghp_1234567890abcdefghijABCDEFGHIJKLMNopqrstuvwxyz"
+	body := `{"model":"glm-5.1","messages":[{"role":"user","content":"here is a key: ` + secret + `"}],"stream":false}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Chat()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if len(*captured) == 0 {
+		t.Fatal("upstream did not receive a body")
+	}
+	if strings.Contains(string(*captured), secret) {
+		t.Fatalf("secret leaked to upstream; body=%s", string(*captured))
+	}
+}
+
+func TestGenerateEndpoint_RedactsSecretBeforeUpstream(t *testing.T) {
+	h, captured := newTestHandlerWithRedaction(t)
+
+	const secret = "ghp_1234567890abcdefghijABCDEFGHIJKLMNopqrstuvwxyz"
+	body := `{"model":"glm-5.1","prompt":"token: ` + secret + `","stream":false}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/generate", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Generate()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(string(*captured), secret) {
+		t.Fatalf("secret leaked to upstream; body=%s", string(*captured))
+	}
+}
+
+func TestChatEndpoint_NoopRedactorPassesBodyThrough(t *testing.T) {
+	h := newTestHandler() // uses redact.NewNoop()
+	const secret = "sk-IMO8bkaQGwuUzfnMTLZzSV0FCToTrfG6h3qgTYZ6wm9HRZ6ImkZbED6NKSembk49"
+	body := `{"model":"glm-5.1","messages":[{"role":"user","content":"key: ` + secret + `"}],"stream":false}`
+
+	req := httptest.NewRequest(http.MethodPost, "/api/chat", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	h.Chat()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	// Noop should not alter the body. We can't inspect what hit the upstream
+	// in this fixture, but the request must at least still succeed and the
+	// handler must not error out trying to parse the redacted body.
 }

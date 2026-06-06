@@ -8,9 +8,10 @@ import (
 	"strings"
 
 	"github.com/mheers/opencode-go-ollama-bridge/internal/handler"
+	"github.com/mheers/opencode-go-ollama-bridge/internal/redact"
 )
 
-func New(h *handler.Handler, debug bool) http.Handler {
+func New(h *handler.Handler, debug bool, redactor redact.Redactor) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", h.Health())
@@ -24,12 +25,12 @@ func New(h *handler.Handler, debug bool) http.Handler {
 	mux.HandleFunc("/v1/models", h.V1Models())
 
 	if debug {
-		return debugMiddleware(mux)
+		return debugMiddleware(mux, redactor)
 	}
 	return mux
 }
 
-func debugMiddleware(next http.Handler) http.Handler {
+func debugMiddleware(next http.Handler, redactor redact.Redactor) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("[REQ] %s %s | Remote: %s | Content-Type: %s",
 			r.Method, r.URL.String(), r.RemoteAddr, r.Header.Get("Content-Type"))
@@ -37,6 +38,7 @@ func debugMiddleware(next http.Handler) http.Handler {
 		if r.Body != nil && r.Method != http.MethodGet {
 			bodyBytes, _ := io.ReadAll(r.Body)
 			r.Body.Close()
+			bodyBytes, _, _ = redactor.Redact(r.Context(), bodyBytes)
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 			bodyStr := string(bodyBytes)

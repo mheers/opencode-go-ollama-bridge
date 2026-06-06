@@ -12,6 +12,7 @@ import (
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/config"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/handler"
+	"github.com/mheers/opencode-go-ollama-bridge/internal/redact"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/server"
 )
 
@@ -22,6 +23,8 @@ var (
 	flagListenPort    string
 	flagOllamaVersion string
 	flagDebug         bool
+	flagRedactSecrets bool
+	flagRedactMode    string
 )
 
 func main() {
@@ -38,6 +41,8 @@ func main() {
 	rootCmd.Flags().StringVarP(&flagListenPort, "port", "p", "", "Listen port e.g. 11434 (overridden by --listen)")
 	rootCmd.Flags().StringVarP(&flagOllamaVersion, "version", "v", "", "Ollama version to report (also set via OLLAMA_BRIDGE_VERSION env, default 0.6.4)")
 	rootCmd.Flags().BoolVarP(&flagDebug, "debug", "d", false, "Enable debug logging of all requests and responses")
+	rootCmd.Flags().BoolVar(&flagRedactSecrets, "redact-secrets", false, "Redact secrets in HTTP request bodies before forwarding upstream (also set via OLLAMA_BRIDGE_REDACT_SECRETS=1)")
+	rootCmd.Flags().StringVar(&flagRedactMode, "redact-mode", "hide", "Redaction mode when --redact-secrets is enabled: 'hide' (default) replaces matches with a placeholder, 'drop' removes the entire line containing a match")
 
 	if err := rootCmd.Execute(); err != nil {
 		log.Fatalf("error: %v", err)
@@ -60,16 +65,26 @@ func run(cmd *cobra.Command, args []string) error {
 		BaseURL:       flagBaseURL,
 		ListenAddr:    listenAddr,
 		OllamaVersion: flagOllamaVersion,
+		RedactSecrets: &flagRedactSecrets,
+		RedactMode:    flagRedactMode,
 	}); err != nil {
 		return err
 	}
 
+	redactor, err := redact.New(cfg.RedactSecrets, redact.Mode(cfg.RedactMode))
+	if err != nil {
+		return err
+	}
+	if cfg.RedactSecrets {
+		log.Printf("secret redaction enabled (mode=%s)", cfg.RedactMode)
+	}
+
 	c := client.New(cfg.BaseURL, cfg.APIKey)
-	h := handler.New(c, cfg.OllamaVersion, flagDebug)
+	h := handler.New(c, cfg.OllamaVersion, flagDebug, redactor)
 
 	srv := &http.Server{
 		Addr:    cfg.ListenAddr,
-		Handler: server.New(h, flagDebug),
+		Handler: server.New(h, flagDebug, redactor),
 	}
 
 	go func() {

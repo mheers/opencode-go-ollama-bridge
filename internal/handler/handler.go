@@ -3,6 +3,7 @@ package handler
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/mheers/opencode-go-ollama-bridge/internal/adapter"
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
+	"github.com/mheers/opencode-go-ollama-bridge/internal/redact"
 )
 
 // dsmlSep is the fence used by DeepSeek's DSML tool-call markup:
@@ -36,13 +38,18 @@ var (
 	// <invoke name>funcname"> — MiniMax malformed form (= and opening " dropped,
 	//   > closes the tag mid-attribute, funcname" becomes "text" before second >)
 	// Both are handled by treating [=>] as the separator between "name" and the value.
-	invokeTagRE    = regexp.MustCompile(`(?is)<invoke\s+name\s*[=>]\s*"?([a-zA-Z_][a-zA-Z0-9_-]*)"?>(.*?)</invoke>`)
-	commandTagRE   = regexp.MustCompile(`(?is)<command>(.*?)</command>`)
-	thinkTailRE    = regexp.MustCompile(`(?is)<think>.*$`)
-	toolCallTailRE = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*$`)
-	bracketCallRE  = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
-	bareCallNameRE = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
-	multiBlankRE   = regexp.MustCompile(`\n{3,}`)
+	invokeTagRE = regexp.MustCompile(`(?is)<invoke\s+name\s*[=>]\s*"?([a-zA-Z_][a-zA-Z0-9_-]*)"?>(.*?)</invoke>`)
+	// <invoke name "filePath": "/tmp/file.go"]> — MiniMax malformed form where
+	// the function name is lost and a single argument key/value is emitted inside
+	// the opening tag itself. The trailing ] before > is present in observed logs.
+	malformedInvokeParamRE = regexp.MustCompile(`(?is)<invoke\s+name\s+"?([a-zA-Z_][a-zA-Z0-9_-]*)"?\s*:\s*"([^"]+)"(?:\]?>)?(.*?)</invoke>`)
+	commandTagRE           = regexp.MustCompile(`(?is)<command>(.*?)</command>`)
+	thinkTailRE            = regexp.MustCompile(`(?is)<think>.*$`)
+	toolCallTailRE         = regexp.MustCompile(`(?is)<tool_call\b[^>]*>.*$`)
+	bracketCallRE          = regexp.MustCompile(`\[\s*([a-zA-Z_][a-zA-Z0-9_-]*)\s+(\{[^\]]*\})\s*\]`)
+	bareCallNameRE         = regexp.MustCompile(`^[a-z_][a-z0-9_]{1,63}$`)
+	looseToolTextRE        = regexp.MustCompile(`(?is)(^|\n\s*\n)\s*([a-zA-Z_][a-zA-Z0-9_-]{1,63})"\s*>\s*(.*?)(?:</tool_call>|$)`)
+	multiBlankRE           = regexp.MustCompile(`\n{3,}`)
 
 	// DeepSeek DSML format regexes — built at init time to embed the const.
 	dsmlToolCallsBlockRE = regexp.MustCompile(`(?is)<` + dsmlSep + `tool_calls>(.*?)</` + dsmlSep + `tool_calls>`)
@@ -78,16 +85,53 @@ type Handler struct {
 	client        *client.Client
 	ollamaVersion string
 	debug         bool
+	redactor      redact.Redactor
 }
 
-func New(c *client.Client, ollamaVersion string, debug bool) *Handler {
-	return &Handler{client: c, ollamaVersion: ollamaVersion, debug: debug}
+func New(c *client.Client, ollamaVersion string, debug bool, redactor redact.Redactor) *Handler {
+	if redactor == nil {
+		redactor = redact.NewNoop()
+	}
+	return &Handler{client: c, ollamaVersion: ollamaVersion, debug: debug, redactor: redactor}
 }
 
 func (h *Handler) logf(format string, args ...interface{}) {
 	if h.debug {
 		log.Printf(format, args...)
 	}
+}
+
+// redactBody runs the configured redactor over body. If redaction is
+// disabled (no-op) it returns the input untouched. Any findings are
+// surfaced in the debug log. The redactor itself handles all error and
+// context-cancellation cases; we only forward an error if the call
+// actually returned one.
+func (h *Handler) redactBody(ctx context.Context, tag string, body []byte) []byte {
+	out, rep, err := h.redactor.Redact(ctx, body)
+	if err != nil {
+		// Redaction is best-effort: log and fall back to the original
+		// body so a misconfigured detector never breaks the proxy.
+		h.logf("[%s] redactor error: %v (passing body through)", tag, err)
+		return body
+	}
+	if n := len(rep.Findings); n > 0 {
+		h.logf("[%s] redacted %d secret(s): %s", tag, n, summariseFindings(rep.Findings))
+	}
+	return out
+}
+
+func summariseFindings(findings []redact.Finding) string {
+	if len(findings) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, f := range findings {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		b.WriteString(f.Rule)
+	}
+	return b.String()
 }
 
 func (h *Handler) logBody(tag string, body []byte) {
@@ -175,6 +219,7 @@ func (h *Handler) Show() http.HandlerFunc {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		body = h.redactBody(r.Context(), "SHOW", body)
 
 		var req struct {
 			Model   string `json:"model"`
@@ -284,6 +329,7 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 			http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
 			return
 		}
+		body = h.redactBody(r.Context(), "V1/CHAT", body)
 
 		var req struct {
 			Model       string          `json:"model"`
@@ -363,7 +409,7 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 		}
 
 		if adapter.IsMiniMaxModel(modelID) {
-			rawBody, repairedBody, err := repairTaggedV1Body(upstreamResp.Body)
+			rawBody, repairedBody, err := repairTaggedV1BodyWithHints(upstreamResp.Body, buildToolArgHints(req.Tools))
 			if err != nil {
 				h.logf("[V1/CHAT] minimax repair decode error: %v", err)
 				http.Error(w, `{"error":"failed to decode upstream response"}`, http.StatusBadGateway)
@@ -761,6 +807,10 @@ func rewriteAnthropicSSEToOpenAI(reader io.Reader, writer io.Writer, flusher htt
 }
 
 func repairTaggedV1Body(r io.Reader) ([]byte, []byte, error) {
+	return repairTaggedV1BodyWithHints(r, nil)
+}
+
+func repairTaggedV1BodyWithHints(r io.Reader, toolArgHints map[string]string) ([]byte, []byte, error) {
 	body, err := io.ReadAll(r)
 	if err != nil {
 		return nil, nil, err
@@ -779,7 +829,7 @@ func repairTaggedV1Body(r io.Reader) ([]byte, []byte, error) {
 		}
 		if msg, ok := choice["message"].(map[string]interface{}); ok {
 			if content, ok := msg["content"].(string); ok {
-				clean, toolCalls := parseTaggedAssistantContent(content)
+				clean, toolCalls := parseTaggedAssistantContentWithHints(content, toolArgHints)
 				msg["content"] = clean
 				if len(toolCalls) > 0 {
 					msg["tool_calls"] = toolCalls
@@ -793,7 +843,7 @@ func repairTaggedV1Body(r io.Reader) ([]byte, []byte, error) {
 		}
 		if delta, ok := choice["delta"].(map[string]interface{}); ok {
 			if content, ok := delta["content"].(string); ok {
-				clean, toolCalls := parseTaggedAssistantContent(content)
+				clean, toolCalls := parseTaggedAssistantContentWithHints(content, toolArgHints)
 				delta["content"] = clean
 				if len(toolCalls) > 0 {
 					delta["tool_calls"] = toolCallsToDelta(toolCalls)
@@ -831,9 +881,68 @@ func sanitizeTaggedText(s string) string {
 }
 
 func parseTaggedAssistantContent(content string) (string, []map[string]interface{}) {
-	clean := sanitizeTaggedText(content)
-	toolCalls := extractToolCalls(content)
+	return parseTaggedAssistantContentWithHints(content, nil)
+}
+
+func parseTaggedAssistantContentWithHints(content string, toolArgHints map[string]string) (string, []map[string]interface{}) {
+	toolCalls := extractToolCallsWithHints(content, toolArgHints)
+	cleanSource := content
+	if len(toolCalls) > 0 {
+		cleanSource = stripRecoveredLooseToolText(cleanSource)
+	}
+	clean := sanitizeTaggedText(cleanSource)
 	return clean, toolCalls
+}
+
+func buildToolArgHints(toolsRaw json.RawMessage) map[string]string {
+	if len(toolsRaw) == 0 {
+		return nil
+	}
+
+	var tools []adapter.OpenAITool
+	if err := json.Unmarshal(toolsRaw, &tools); err != nil {
+		return nil
+	}
+
+	hints := make(map[string]string)
+	for _, tool := range tools {
+		name := strings.TrimSpace(tool.Function.Name)
+		if name == "" {
+			continue
+		}
+		if key := inferPrimaryToolArgKey(tool.Function.Parameters); key != "" {
+			hints[name] = key
+		}
+	}
+	if len(hints) == 0 {
+		return nil
+	}
+	return hints
+}
+
+func inferPrimaryToolArgKey(parameters json.RawMessage) string {
+	if len(parameters) == 0 {
+		return ""
+	}
+
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(parameters, &schema); err != nil {
+		return ""
+	}
+	if len(schema.Properties) == 1 {
+		for key := range schema.Properties {
+			return key
+		}
+	}
+	if len(schema.Required) == 1 {
+		if _, ok := schema.Properties[schema.Required[0]]; ok {
+			return schema.Required[0]
+		}
+	}
+	return ""
 }
 
 // pluralSingleObjectToTC converts a single JSON object (from inside a
@@ -1150,6 +1259,68 @@ func normalizeJSObject(s string) string {
 	return result
 }
 
+func inferMalformedInvokeToolName(params map[string]string) string {
+	if _, ok := params["command"]; ok {
+		return "run_in_terminal"
+	}
+	if _, ok := params["filePath"]; ok {
+		return "read_file"
+	}
+	return ""
+}
+
+func extractLooseToolText(raw string, toolArgHints map[string]string) []map[string]interface{} {
+	if len(toolArgHints) == 0 {
+		return nil
+	}
+
+	normalized := miniMaxWrapperRE.ReplaceAllString(raw, "")
+	normalized = thinkBlockRE.ReplaceAllString(normalized, "")
+	match := looseToolTextRE.FindStringSubmatch(normalized)
+	if len(match) < 4 {
+		return nil
+	}
+
+	name := strings.TrimSpace(match[2])
+	argKey := toolArgHints[name]
+	if argKey == "" {
+		return nil
+	}
+	body := strings.TrimSpace(match[3])
+	body = strings.TrimSuffix(body, "</tool_call>")
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return nil
+	}
+
+	argsJSON := "{}"
+	if b, err := json.Marshal(map[string]string{argKey: body}); err == nil {
+		argsJSON = string(b)
+	}
+
+	return []map[string]interface{}{{
+		"id":   "call_0",
+		"type": "function",
+		"function": map[string]interface{}{
+			"name":      name,
+			"arguments": argsJSON,
+		},
+	}}
+}
+
+func stripRecoveredLooseToolText(raw string) string {
+	normalized := miniMaxWrapperRE.ReplaceAllString(raw, "")
+	match := looseToolTextRE.FindStringSubmatchIndex(normalized)
+	if len(match) < 6 {
+		return raw
+	}
+	nameStart := match[4]
+	if nameStart < 0 || nameStart > len(normalized) {
+		return raw
+	}
+	return normalized[:nameStart]
+}
+
 // splitOnToolCallTag splits s on every occurrence of "<tool_call>" (case-insensitive)
 // and returns the segments that follow each opener (the first empty segment before
 // the first opener is dropped).
@@ -1260,6 +1431,10 @@ func extractDSMLToolCalls(raw string) []map[string]interface{} {
 }
 
 func extractToolCalls(raw string) []map[string]interface{} {
+	return extractToolCallsWithHints(raw, nil)
+}
+
+func extractToolCallsWithHints(raw string, toolArgHints map[string]string) []map[string]interface{} {
 	// DeepSeek DSML format: <｜｜DSML｜｜tool_calls>...<｜｜DSML｜｜invoke name="fn">...<｜｜DSML｜｜invoke>...
 	if dsmlMatches := dsmlToolCallsBlockRE.FindAllStringSubmatch(raw, -1); len(dsmlMatches) > 0 {
 		return extractDSMLToolCalls(raw)
@@ -1290,7 +1465,7 @@ func extractToolCalls(raw string) []map[string]interface{} {
 		}
 	}
 	if len(matches) == 0 {
-		return nil
+		return extractLooseToolText(raw, toolArgHints)
 	}
 
 	out := make([]map[string]interface{}, 0)
@@ -1550,6 +1725,66 @@ func extractToolCalls(raw string) []map[string]interface{} {
 			callIdx++
 		}
 
+		for _, im := range malformedInvokeParamRE.FindAllStringSubmatch(inner, -1) {
+			if len(im) < 4 {
+				continue
+			}
+
+			params := map[string]string{}
+			key := strings.TrimSpace(im[1])
+			value := strings.TrimSpace(im[2])
+			if key != "" && value != "" {
+				params[key] = value
+			}
+
+			body := im[3]
+			if cm := commandTagRE.FindStringSubmatch(body); len(cm) >= 2 {
+				params["command"] = strings.TrimSpace(cm[1])
+			}
+			for _, pm := range namedParamTagRE.FindAllStringSubmatch(body, -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				k := strings.TrimSpace(pm[1])
+				v := strings.TrimSpace(pm[2])
+				if k == "" {
+					continue
+				}
+				params[k] = v
+			}
+			for _, pm := range parameterTagRE.FindAllStringSubmatch(body, -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				k := strings.TrimSpace(pm[1])
+				v := strings.TrimSpace(pm[2])
+				if k == "" {
+					continue
+				}
+				params[k] = v
+			}
+
+			name := inferMalformedInvokeToolName(params)
+			if name == "" {
+				continue
+			}
+
+			argsJSON := "{}"
+			if b, err := json.Marshal(params); err == nil {
+				argsJSON = string(b)
+			}
+
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+
 		for _, b := range bracketCallRE.FindAllStringSubmatch(inner, -1) {
 			if len(b) < 3 {
 				continue
@@ -1634,7 +1869,7 @@ func extractToolCalls(raw string) []map[string]interface{} {
 	}
 
 	if len(out) == 0 {
-		return nil
+		return extractLooseToolText(raw, toolArgHints)
 	}
 	return out
 }
@@ -2320,6 +2555,7 @@ func (h *Handler) Chat() http.HandlerFunc {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		body = h.redactBody(r.Context(), "CHAT", body)
 
 		var ollamaReq adapter.OllamaChatRequest
 		if err := json.Unmarshal(body, &ollamaReq); err != nil {
@@ -2449,6 +2685,7 @@ func (h *Handler) Generate() http.HandlerFunc {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
 		}
+		body = h.redactBody(r.Context(), "GENERATE", body)
 
 		var genReq adapter.OllamaGenerateRequest
 		if err := json.Unmarshal(body, &genReq); err != nil {
