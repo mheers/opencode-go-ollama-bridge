@@ -271,6 +271,13 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 
 		h.logf("[V1/CHAT] model=%s stream=%v body_has_reasoning=%v", modelID, req.Stream, strings.Contains(string(body), "reasoning_content"))
 
+		// Anthropic-only models: translate OpenAI request → Anthropic messages API → OpenAI response.
+		if adapter.IsAnthropicOnlyModel(modelID) {
+			h.logf("[V1/CHAT] routing to anthropic backend (anthropic-only model) for %s", modelID)
+			h.handleV1Anthropic(w, body, modelID, req.Stream)
+			return
+		}
+
 		var upstreamResp *http.Response
 		var upstreamErr error
 
@@ -395,6 +402,326 @@ func (h *Handler) V1ChatCompletions() http.HandlerFunc {
 		w.WriteHeader(upstreamResp.StatusCode)
 		w.Write(repairedBody)
 	}
+}
+
+// handleV1Anthropic routes a /v1/chat/completions request through the Anthropic
+// messages API and converts the response back to OpenAI format.
+func (h *Handler) handleV1Anthropic(w http.ResponseWriter, rawBody []byte, modelID string, stream bool) {
+	// Parse the incoming OpenAI-format request.
+	var openAIReq adapter.OpenAIRequest
+	if err := json.Unmarshal(rawBody, &openAIReq); err != nil {
+		h.logf("[V1/ANTHROPIC] parse error: %v", err)
+		http.Error(w, `{"error":"bad request"}`, http.StatusBadRequest)
+		return
+	}
+	openAIReq.Model = modelID
+
+	// Convert OpenAI messages → OllamaChatRequest → AnthropicRequest.
+	ollamaReq := adapter.OpenAIRequestToOllama(&openAIReq)
+	anthReq := adapter.ChatRequestToAnthropic(ollamaReq)
+	anthReq.Stream = stream
+
+	resp, err := h.client.Messages(anthReq)
+	if err != nil {
+		h.logf("[V1/ANTHROPIC] upstream error: %v", err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadGateway)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error": map[string]interface{}{
+				"message": fmt.Sprintf("upstream request failed: %v", err),
+				"type":    "upstream_error",
+			},
+		})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 16384))
+		h.logf("[V1/ANTHROPIC] upstream error status %d: %s", resp.StatusCode, string(body))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(resp.StatusCode)
+		w.Write(body)
+		return
+	}
+
+	rawResp, err := io.ReadAll(resp.Body)
+	if err != nil {
+		h.logf("[V1/ANTHROPIC] read error: %v", err)
+		http.Error(w, `{"error":"failed to read upstream response"}`, http.StatusBadGateway)
+		return
+	}
+
+	h.logBody("[V1/ANTHROPIC] upstream raw body:", rawResp)
+
+	if stream {
+		// Anthropic SSE → OpenAI SSE
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.WriteHeader(http.StatusOK)
+		flusher, _ := w.(http.Flusher)
+		if err := rewriteAnthropicSSEToOpenAI(bytes.NewReader(rawResp), w, flusher, modelID); err != nil {
+			h.logf("[V1/ANTHROPIC] stream rewrite error: %v", err)
+		}
+		return
+	}
+
+	// Non-stream: Anthropic JSON → OpenAI JSON
+	openAIBody, err := anthropicBodyToOpenAIJSON(rawResp, modelID)
+	if err != nil {
+		h.logf("[V1/ANTHROPIC] convert error: %v", err)
+		http.Error(w, `{"error":"failed to convert upstream response"}`, http.StatusBadGateway)
+		return
+	}
+
+	h.logBody("[V1/ANTHROPIC] converted body:", openAIBody)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write(openAIBody)
+}
+
+// anthropicBodyToOpenAIJSON converts a non-stream Anthropic /messages response
+// to an OpenAI /chat/completions response.
+func anthropicBodyToOpenAIJSON(raw []byte, model string) ([]byte, error) {
+	var anthResp struct {
+		ID         string `json:"id"`
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
+			Type     string          `json:"type"`
+			Text     string          `json:"text,omitempty"`
+			ID       string          `json:"id,omitempty"`
+			Name     string          `json:"name,omitempty"`
+			Input    json.RawMessage `json:"input,omitempty"`
+		} `json:"content"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &anthResp); err != nil {
+		return nil, fmt.Errorf("unmarshal anthropic response: %w", err)
+	}
+
+	var textParts []string
+	toolCalls := make([]adapter.OpenAIToolCall, 0)
+	for _, block := range anthResp.Content {
+		switch block.Type {
+		case "text":
+			if block.Text != "" {
+				textParts = append(textParts, block.Text)
+			}
+		case "tool_use":
+			argsStr := "{}"
+			if len(block.Input) > 0 {
+				argsStr = string(block.Input)
+			}
+			toolCalls = append(toolCalls, adapter.OpenAIToolCall{
+				ID:   block.ID,
+				Type: "function",
+				Function: adapter.OpenAIToolFunction{
+					Name:      block.Name,
+					Arguments: argsStr,
+				},
+			})
+		// "thinking" and "thinking" blocks are intentionally skipped
+		}
+	}
+
+	content := strings.Join(textParts, "")
+	finishReason := "stop"
+	if len(toolCalls) > 0 || anthResp.StopReason == "tool_use" {
+		finishReason = "tool_calls"
+	}
+
+	resp := adapter.OpenAIResponse{
+		ID:      anthResp.ID,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []adapter.OpenAIChoice{
+			{
+				Index: 0,
+				Message: &adapter.OpenAIMessageResp{
+					Role:      "assistant",
+					Content:   content,
+					ToolCalls: toolCalls,
+				},
+				FinishReason: &finishReason,
+			},
+		},
+		Usage: &adapter.OpenAIUsage{
+			PromptTokens:     anthResp.Usage.InputTokens,
+			CompletionTokens: anthResp.Usage.OutputTokens,
+			TotalTokens:      anthResp.Usage.InputTokens + anthResp.Usage.OutputTokens,
+		},
+	}
+	return json.Marshal(resp)
+}
+
+// rewriteAnthropicSSEToOpenAI reads a buffered Anthropic SSE body and emits
+// OpenAI-format SSE chunks.
+func rewriteAnthropicSSEToOpenAI(reader io.Reader, writer io.Writer, flusher http.Flusher, model string) error {
+	type toolState struct {
+		id   string
+		name string
+		args strings.Builder
+	}
+
+	msgID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+
+	tools := map[int]*toolState{}
+	order := []int{}
+	finishReason := "stop"
+	headerSent := false
+
+	flush := func(data map[string]interface{}) error {
+		b, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(writer, "data: %s\n\n", b); err != nil {
+			return err
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+
+	mkChunk := func(delta map[string]interface{}, fr interface{}) map[string]interface{} {
+		return map[string]interface{}{
+			"id":      msgID,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []interface{}{map[string]interface{}{
+				"index":         0,
+				"delta":         delta,
+				"finish_reason": fr,
+			}},
+		}
+	}
+
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024)
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+
+		var event struct {
+			Type  string `json:"type"`
+			Index *int   `json:"index"`
+			Delta *struct {
+				Type        string `json:"type"`
+				Text        string `json:"text"`
+				PartialJSON string `json:"partial_json"`
+				StopReason  string `json:"stop_reason"`
+			} `json:"delta"`
+			ContentBlock *struct {
+				Type string `json:"type"`
+				ID   string `json:"id"`
+				Name string `json:"name"`
+			} `json:"content_block"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			continue
+		}
+
+		switch event.Type {
+		case "message_start":
+			if !headerSent {
+				if err := flush(mkChunk(map[string]interface{}{"role": "assistant", "content": ""}, nil)); err != nil {
+					return err
+				}
+				headerSent = true
+			}
+
+		case "content_block_start":
+			if event.ContentBlock == nil || event.Index == nil {
+				continue
+			}
+			idx := *event.Index
+			if event.ContentBlock.Type == "tool_use" {
+				tools[idx] = &toolState{id: event.ContentBlock.ID, name: event.ContentBlock.Name}
+				order = append(order, idx)
+				finishReason = "tool_calls"
+				tcIdx := len(order) - 1
+				tc := map[string]interface{}{
+					"index": tcIdx,
+					"id":    event.ContentBlock.ID,
+					"type":  "function",
+					"function": map[string]interface{}{
+						"name":      event.ContentBlock.Name,
+						"arguments": "",
+					},
+				}
+				if err := flush(mkChunk(map[string]interface{}{"tool_calls": []interface{}{tc}}, nil)); err != nil {
+					return err
+				}
+			}
+			// "thinking" content blocks are silently skipped
+
+		case "content_block_delta":
+			if event.Delta == nil || event.Index == nil {
+				continue
+			}
+			idx := *event.Index
+			switch event.Delta.Type {
+			case "text_delta":
+				if err := flush(mkChunk(map[string]interface{}{"content": event.Delta.Text}, nil)); err != nil {
+					return err
+				}
+			case "input_json_delta":
+				if tc, ok := tools[idx]; ok {
+					tc.args.WriteString(event.Delta.PartialJSON)
+					tcIdx := 0
+					for i, o := range order {
+						if o == idx {
+							tcIdx = i
+							break
+						}
+					}
+					if err := flush(mkChunk(map[string]interface{}{
+						"tool_calls": []interface{}{map[string]interface{}{
+							"index":    tcIdx,
+							"function": map[string]interface{}{"arguments": event.Delta.PartialJSON},
+						}},
+					}, nil)); err != nil {
+						return err
+					}
+				}
+			}
+
+		case "message_delta":
+			if event.Delta != nil && event.Delta.StopReason != "" {
+				if event.Delta.StopReason == "tool_use" {
+					finishReason = "tool_calls"
+				} else {
+					finishReason = event.Delta.StopReason
+				}
+			}
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	// Final chunk with finish_reason.
+	if err := flush(mkChunk(map[string]interface{}{}, finishReason)); err != nil {
+		return err
+	}
+	_, err := fmt.Fprintf(writer, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
+	}
+	return err
 }
 
 func repairTaggedV1Body(r io.Reader) ([]byte, []byte, error) {
@@ -1430,6 +1757,12 @@ func (h *Handler) Chat() http.HandlerFunc {
 
 		if adapter.IsMiniMaxModel(ollamaReq.Model) {
 			h.logf("[CHAT] routing to anthropic backend for %s", ollamaReq.Model)
+			h.handleChatAnthropic(w, &ollamaReq)
+			return
+		}
+
+		if adapter.IsAnthropicOnlyModel(ollamaReq.Model) {
+			h.logf("[CHAT] routing to anthropic backend (anthropic-only model) for %s", ollamaReq.Model)
 			h.handleChatAnthropic(w, &ollamaReq)
 			return
 		}

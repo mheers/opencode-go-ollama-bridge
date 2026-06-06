@@ -30,6 +30,7 @@ var (
 	flagStream     bool
 	flagTimeout    time.Duration
 	flagOutputJSON bool
+	flagOutputDir  string
 )
 
 func main() {
@@ -45,15 +46,12 @@ func main() {
 	root.Flags().BoolVar(&flagStream, "stream", false, "Use streaming mode (SSE)")
 	root.Flags().DurationVar(&flagTimeout, "timeout", 90*time.Second, "Per-model request timeout")
 	root.Flags().BoolVar(&flagOutputJSON, "json", false, "Print raw JSON response for each model (default: pretty summary)")
+	root.Flags().StringVar(&flagOutputDir, "output-dir", "probe-results", "Directory to save per-model raw JSON results (empty string to disable)")
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Core logic
-// ---------------------------------------------------------------------------
 
 func run(_ *cobra.Command, _ []string) error {
 	if flagAPIKey == "" {
@@ -67,8 +65,15 @@ func run(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("list models: %w", err)
 	}
 
+	if flagOutputDir != "" {
+		if err := os.MkdirAll(flagOutputDir, 0o755); err != nil {
+			return fmt.Errorf("create output dir: %w", err)
+		}
+	}
+
 	type result struct {
 		model    string
+		backend  string
 		duration time.Duration
 		summary  modelSummary
 		rawBody  []byte
@@ -84,43 +89,59 @@ func run(_ *cobra.Command, _ []string) error {
 		start := time.Now()
 		raw, summary, probeErr := probeModel(baseURL, model)
 		dur := time.Since(start)
+		backend := "openai"
+
+		if probeErr != nil && isOACompatError(probeErr) {
+			fmt.Printf("   OpenAI path failed (%v), retrying via Anthropic messages API…\n", probeErr)
+			start = time.Now()
+			raw, summary, probeErr = probeModelAnthropic(baseURL, model)
+			dur = time.Since(start)
+			backend = "anthropic"
+		}
 
 		if probeErr != nil {
 			fmt.Printf("   ERROR: %v\n", probeErr)
 		} else {
+			fmt.Printf("  backend    : %s\n", backend)
 			printSummary(model, summary)
 			if flagOutputJSON {
 				fmt.Printf("\n--- RAW RESPONSE ---\n%s\n", indentJSON(raw))
 			}
 		}
 
+		if flagOutputDir != "" && len(raw) > 0 {
+			filename := flagOutputDir + "/" + strings.ReplaceAll(model, "/", "_") + "." + backend + ".json"
+			if writeErr := os.WriteFile(filename, []byte(indentJSON(raw)), 0o644); writeErr != nil {
+				fmt.Printf("   WARN: failed to save result to %s: %v\n", filename, writeErr)
+			} else {
+				fmt.Printf("  saved      : %s\n", filename)
+			}
+		}
+
 		results = append(results, result{
-			model: model, duration: dur, summary: summary, rawBody: raw, err: probeErr,
+			model: model, backend: backend, duration: dur, summary: summary, rawBody: raw, err: probeErr,
 		})
 	}
 
-	// Print compatibility table
 	fmt.Printf("\n%s\n  COMPATIBILITY TABLE\n%s\n", sep, sep)
-	fmt.Printf("%-30s  %-8s  %-10s  %-10s  %s\n", "MODEL", "LATENCY", "TOOL_CALLS", "REASONING", "FORMAT DETECTED")
-	fmt.Printf("%-30s  %-8s  %-10s  %-10s  %s\n",
-		strings.Repeat("-", 30), strings.Repeat("-", 8), strings.Repeat("-", 10), strings.Repeat("-", 10), strings.Repeat("-", 24))
+	fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n", "MODEL", "BACKEND", "LATENCY", "TOOL_CALLS", "REASONING", "FORMAT DETECTED")
+	fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n",
+		strings.Repeat("-", 30), strings.Repeat("-", 9), strings.Repeat("-", 8),
+		strings.Repeat("-", 10), strings.Repeat("-", 10), strings.Repeat("-", 24))
 	for _, r := range results {
 		if r.err != nil {
-			fmt.Printf("%-30s  %-8s  %-10s  %-10s  %s\n", r.model, fmtDur(r.duration), "ERROR", "ERROR", r.err.Error())
+			fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n",
+				r.model, r.backend, fmtDur(r.duration), "ERROR", "ERROR", r.err.Error())
 			continue
 		}
-		fmt.Printf("%-30s  %-8s  %-10s  %-10s  %s\n",
-			r.model, fmtDur(r.duration),
+		fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n",
+			r.model, r.backend, fmtDur(r.duration),
 			boolMark(r.summary.hasToolCalls), boolMark(r.summary.hasReasoning),
 			r.summary.formatTag)
 	}
 	fmt.Println()
 	return nil
 }
-
-// ---------------------------------------------------------------------------
-// Model resolution
-// ---------------------------------------------------------------------------
 
 func resolveModels(baseURL string) ([]string, error) {
 	if flagModels != "" {
@@ -167,22 +188,24 @@ func resolveModels(baseURL string) ([]string, error) {
 	return out, nil
 }
 
-// ---------------------------------------------------------------------------
-// Per-model probe
-// ---------------------------------------------------------------------------
-
 type modelSummary struct {
 	hasToolCalls bool
 	hasReasoning bool
-	formatTag    string   // human-readable format name
-	contentSnip  string   // first 200 chars of raw content
-	toolNames    []string // tool names found in tool_calls
+	formatTag    string
+	contentSnip  string
+	toolNames    []string
+}
+
+func isOACompatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "oa-compat") || strings.Contains(s, "not supported for format")
 }
 
 func probeModel(baseURL, model string) ([]byte, modelSummary, error) {
-	reqBody := buildProbeRequest(model, flagStream)
-
-	bodyBytes, err := json.Marshal(reqBody)
+	bodyBytes, err := json.Marshal(buildProbeRequest(model, flagStream))
 	if err != nil {
 		return nil, modelSummary{}, err
 	}
@@ -216,91 +239,171 @@ func probeModel(baseURL, model string) ([]byte, modelSummary, error) {
 	} else {
 		summary = analyseJSON(raw)
 	}
-
 	return raw, summary, nil
 }
 
-// ---------------------------------------------------------------------------
-// Request builder
-// ---------------------------------------------------------------------------
-
-func buildProbeRequest(model string, stream bool) map[string]interface{} {
-	tools := []map[string]interface{}{
-		{
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":        "list_files",
-				"description": "List the files in a given directory path on the local filesystem.",
-				"parameters": map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"path": map[string]interface{}{
-							"type":        "string",
-							"description": "The absolute directory path to list, e.g. /tmp",
-						},
-					},
-					"required": []string{"path"},
+func probeModelAnthropic(baseURL, model string) ([]byte, modelSummary, error) {
+	type Tool struct {
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		InputSchema interface{} `json:"input_schema"`
+	}
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"max_tokens": 1024,
+		"stream":     false,
+		"tools": []Tool{{
+			Name:        "list_files",
+			Description: "List the files in a given directory path on the local filesystem.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{"type": "string", "description": "Absolute directory path"},
 				},
+				"required": []string{"path"},
 			},
-		},
-		{
-			"type": "function",
-			"function": map[string]interface{}{
-				"name":        "read_file",
-				"description": "Read the contents of a file at the given path.",
-				"parameters": map[string]interface{}{
-					"type": "object",
-					"properties": map[string]interface{}{
-						"path": map[string]interface{}{
-							"type":        "string",
-							"description": "The absolute file path to read",
-						},
-					},
-					"required": []string{"path"},
-				},
-			},
+		}},
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
 		},
 	}
 
+	bodyBytes, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+
+	httpClient := &http.Client{Timeout: flagTimeout}
+	req, err := http.NewRequest("POST", baseURL+"/messages", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", flagAPIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+
+	if resp.StatusCode >= 400 {
+		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
+	}
+
+	return raw, analyseAnthropicJSON(raw), nil
+}
+
+func buildProbeRequest(model string, stream bool) map[string]interface{} {
 	return map[string]interface{}{
 		"model":  model,
 		"stream": stream,
-		"tools":  tools,
-		"messages": []map[string]interface{}{
+		"tools": []map[string]interface{}{
 			{
-				"role":    "user",
-				"content": "Please list the files in the /tmp directory using the list_files tool.",
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        "list_files",
+					"description": "List the files in a given directory path on the local filesystem.",
+					"parameters": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"path": map[string]interface{}{
+								"type":        "string",
+								"description": "The absolute directory path to list, e.g. /tmp",
+							},
+						},
+						"required": []string{"path"},
+					},
+				},
 			},
+			{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        "read_file",
+					"description": "Read the contents of a file at the given path.",
+					"parameters": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"path": map[string]interface{}{
+								"type":        "string",
+								"description": "The absolute file path to read",
+							},
+						},
+						"required": []string{"path"},
+					},
+				},
+			},
+		},
+		"messages": []map[string]interface{}{
+			{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
 		},
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Response analysers
-// ---------------------------------------------------------------------------
 
 func analyseJSON(raw []byte) modelSummary {
 	var payload map[string]interface{}
 	if err := json.Unmarshal(raw, &payload); err != nil {
 		return modelSummary{formatTag: "invalid JSON"}
 	}
-
 	choices, _ := payload["choices"].([]interface{})
 	if len(choices) == 0 {
 		return modelSummary{formatTag: "no choices"}
 	}
-
 	choice, _ := choices[0].(map[string]interface{})
 	msg, _ := choice["message"].(map[string]interface{})
 	if msg == nil {
 		msg, _ = choice["delta"].(map[string]interface{})
 	}
-
 	return analyseMessage(msg)
 }
 
+func analyseAnthropicJSON(raw []byte) modelSummary {
+	var payload struct {
+		Content []struct {
+			Type     string `json:"type"`
+			Text     string `json:"text,omitempty"`
+			Thinking string `json:"thinking,omitempty"`
+			Name     string `json:"name,omitempty"`
+		} `json:"content"`
+		StopReason string `json:"stop_reason"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return modelSummary{formatTag: "invalid JSON"}
+	}
+
+	summary := modelSummary{}
+	var textParts []string
+	for _, block := range payload.Content {
+		switch block.Type {
+		case "text":
+			textParts = append(textParts, block.Text)
+		case "thinking":
+			if block.Thinking != "" {
+				summary.hasReasoning = true
+			}
+		case "tool_use":
+			summary.hasToolCalls = true
+			if block.Name != "" {
+				summary.toolNames = append(summary.toolNames, block.Name)
+			}
+		}
+	}
+	if summary.hasToolCalls {
+		summary.formatTag = "anthropic native tool_use"
+	} else {
+		summary.formatTag = "text only (no tool calls)"
+	}
+	summary.contentSnip = truncate(strings.Join(textParts, ""), 300)
+	return summary
+}
+
 func analyseSSE(raw []byte) modelSummary {
-	// Accumulate all delta content + tool_calls across SSE chunks.
 	type accTC struct {
 		id   string
 		typ  string
@@ -308,7 +411,7 @@ func analyseSSE(raw []byte) modelSummary {
 		args strings.Builder
 	}
 	contentBuf := strings.Builder{}
-	var reasonBuf strings.Builder
+	reasonBuf := strings.Builder{}
 	toolCallMap := map[int]*accTC{}
 
 	scanner := bufio.NewScanner(bytes.NewReader(raw))
@@ -377,12 +480,9 @@ func analyseSSE(raw []byte) modelSummary {
 
 	summary := modelSummary{}
 	content := contentBuf.String()
-	reasoning := reasonBuf.String()
-
-	if reasoning != "" {
+	if reasonBuf.Len() > 0 {
 		summary.hasReasoning = true
 	}
-
 	if len(toolCallMap) > 0 {
 		summary.hasToolCalls = true
 		for i := 0; i < len(toolCallMap); i++ {
@@ -392,16 +492,12 @@ func analyseSSE(raw []byte) modelSummary {
 		}
 		summary.formatTag = "openai native tool_calls (SSE)"
 	}
-
-	// Check for tag-based formats inside content
-	tagFormat := detectTagFormat(content)
-	if tagFormat != "" {
+	if tagFormat := detectTagFormat(content); tagFormat != "" {
 		if !summary.hasToolCalls {
 			summary.hasToolCalls = true
 		}
 		summary.formatTag = tagFormat
 	}
-
 	if summary.formatTag == "" {
 		if summary.hasToolCalls {
 			summary.formatTag = "openai native tool_calls (SSE)"
@@ -409,7 +505,6 @@ func analyseSSE(raw []byte) modelSummary {
 			summary.formatTag = "text only (no tool calls)"
 		}
 	}
-
 	summary.contentSnip = truncate(content, 300)
 	return summary
 }
@@ -418,13 +513,13 @@ func analyseMessage(msg map[string]interface{}) modelSummary {
 	if msg == nil {
 		return modelSummary{formatTag: "no message"}
 	}
-
 	summary := modelSummary{}
-
 	if rc, ok := msg["reasoning_content"].(string); ok && rc != "" {
 		summary.hasReasoning = true
 	}
-
+	if rc, ok := msg["reasoning"].(string); ok && rc != "" {
+		summary.hasReasoning = true
+	}
 	if tcs, ok := msg["tool_calls"].([]interface{}); ok && len(tcs) > 0 {
 		summary.hasToolCalls = true
 		for _, tc := range tcs {
@@ -440,13 +535,11 @@ func analyseMessage(msg map[string]interface{}) modelSummary {
 		}
 		summary.formatTag = "openai native tool_calls"
 	}
-
 	content := ""
 	switch v := msg["content"].(type) {
 	case string:
 		content = v
 	case []interface{}:
-		// Anthropic-style content blocks
 		for _, block := range v {
 			if bm, ok := block.(map[string]interface{}); ok {
 				if t, _ := bm["type"].(string); t == "text" {
@@ -457,66 +550,45 @@ func analyseMessage(msg map[string]interface{}) modelSummary {
 			}
 		}
 	}
-
-	// Check content for non-standard tag formats
-	tagFormat := detectTagFormat(content)
-	if tagFormat != "" {
+	if tagFormat := detectTagFormat(content); tagFormat != "" {
 		if !summary.hasToolCalls {
 			summary.hasToolCalls = true
 		}
 		summary.formatTag = tagFormat
 	}
-
 	if summary.formatTag == "" {
 		summary.formatTag = "text only (no tool calls)"
 	}
-
 	summary.contentSnip = truncate(content, 300)
 	return summary
 }
 
-// detectTagFormat identifies non-standard tool-call markup inside content text.
 func detectTagFormat(content string) string {
 	if content == "" {
 		return ""
 	}
-
-	// DeepSeek DSML format
 	if strings.Contains(content, "｜｜DSML｜｜tool_calls") {
 		return "deepseek DSML (<｜｜DSML｜｜tool_calls>)"
 	}
-
-	// MiniMax wrapper + tool_call
 	if strings.Contains(content, "]<]minimax[>[") {
 		return "minimax wrapped (<tool_call> + ]<]minimax[>[)"
 	}
-
-	// Generic tool_call tags
 	if strings.Contains(content, "<tool_call>") || strings.Contains(content, "<tool_call ") {
-		// Check for invoke sub-tag (MiniMax / Qwen style)
 		if strings.Contains(content, "<invoke") {
 			return "<tool_call><invoke name=...> style"
 		}
-		// Check for function sub-tag
 		if strings.Contains(content, "<function ") {
 			return "<tool_call><function name> style"
 		}
 		return "<tool_call>{json}</tool_call> style"
 	}
-
-	// Bracket call style: [function_name {"arg": "val"}]
 	if strings.Contains(content, "[") && strings.Contains(content, "{") {
 		return "bracket call [name {json}] style"
 	}
-
 	return ""
 }
 
-// ---------------------------------------------------------------------------
-// Output helpers
-// ---------------------------------------------------------------------------
-
-func printSummary(model string, s modelSummary) {
+func printSummary(_ string, s modelSummary) {
 	fmt.Printf("  tool_calls : %s\n", boolMark(s.hasToolCalls))
 	fmt.Printf("  reasoning  : %s\n", boolMark(s.hasReasoning))
 	fmt.Printf("  format     : %s\n", s.formatTag)

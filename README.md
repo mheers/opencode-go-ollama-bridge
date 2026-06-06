@@ -165,17 +165,32 @@ make build
 
 ## Model compatibility
 
-The bridge normalises non-standard tool-call markup back to the OpenAI `tool_calls` format before sending the response downstream.
+The bridge normalises non-standard tool-call markup and routes models to the correct upstream endpoint automatically.
+Run `make probe` to refresh results against your API key.
 
-| Provider / model family | Tool-call format detected | Notes |
-|-------------------------|---------------------------|-------|
-| **MiniMax** (`minimax-m2.*`, `mimo-*`) | `]<]minimax[>[<tool_call>…</tool_call>` wrapper, `<invoke name="…">` / `<parameter=…>` / `<function …>` tags | Bridge forces `stream=false` upstream, repairs the response, then re-emits as SSE |
-| **Qwen3** (`qwen3.*`) | Standard OpenAI `tool_calls` JSON | No rewriting needed |
-| **DeepSeek** (`deepseek-*`) | DSML format: `<｜｜DSML｜｜tool_calls>` / `<｜｜DSML｜｜invoke name="…">` / `<｜｜DSML｜｜parameter name="…">` | Bridge parses DSML blocks and converts to OpenAI tool_calls |
-| **GLM** (`glm-*`) | Standard OpenAI `tool_calls` JSON | No rewriting needed |
-| **Kimi** (`kimi-*`) | Standard OpenAI `tool_calls` JSON | No rewriting needed |
+| Model | Backend path | Tool calls | Reasoning | Notes |
+|-------|-------------|------------|-----------|-------|
+| `minimax-m3` | OpenAI compat | ✓ | ✗ | Native `tool_calls`; `<think>` stripped from content |
+| `minimax-m2.7` | OpenAI compat | ✓ | ✗ | Native `tool_calls` |
+| `minimax-m2.5` | OpenAI compat (repaired) | ✓ | ✓ | Bridge forces `stream=false`, strips `<tool_call>` markup |
+| `deepseek-v4-pro` | OpenAI compat | ✓ | ✓ | Native `tool_calls`; DSML fallback parser handles edge cases |
+| `deepseek-v4-flash` | OpenAI compat | ✓ | ✓ | Native `tool_calls`; DSML fallback parser handles edge cases |
+| `qwen3.7-max` | **Anthropic messages API** | ✓ | ✓ | Only model requiring `/messages`; bridge translates request+response |
+| `qwen3.7-plus` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `qwen3.6-plus` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `qwen3.5-plus` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `glm-5.1` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `glm-5` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `kimi-k2.6` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `kimi-k2.5` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `mimo-v2-pro` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `mimo-v2-omni` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `mimo-v2.5-pro` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `mimo-v2.5` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
+| `hy3-preview` | OpenAI compat | ✓ | ✓ | Native `tool_calls` |
 
-If you discover a model that produces a different non-standard format, open an issue or PR — adding support requires a new regex pattern and a small parser in `internal/handler/handler.go`.
+To add support for a new model that uses a non-standard format: add a regex pattern and parser in `internal/handler/handler.go`.
+If the model only supports the Anthropic messages API, add it to `IsAnthropicOnlyModel` in `internal/adapter/chat.go`.
 
 ## License
 

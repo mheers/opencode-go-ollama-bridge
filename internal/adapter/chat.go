@@ -326,8 +326,95 @@ func GenerateRequestToOpenAI(generateReq *OllamaGenerateRequest) *OpenAIRequest 
 	return req
 }
 
+// OpenAIRequestToOllama converts an OpenAI /v1/chat/completions request to the
+// internal OllamaChatRequest representation so it can be forwarded to the
+// Anthropic messages endpoint via ChatRequestToAnthropic.
+func OpenAIRequestToOllama(req *OpenAIRequest) *OllamaChatRequest {
+	stream := req.Stream
+	ollamaReq := &OllamaChatRequest{
+		Model:    req.Model,
+		Stream:   &stream,
+		Messages: make([]OllamaMessage, 0, len(req.Messages)),
+	}
+
+	if req.Temperature != nil || req.TopP != nil || req.MaxTokens != nil {
+		ollamaReq.Options = &OllamaOptions{
+			Temperature: req.Temperature,
+			TopP:        req.TopP,
+		}
+		if req.MaxTokens != nil {
+			ollamaReq.Options.NumPredict = req.MaxTokens
+		}
+	}
+
+	for _, msg := range req.Messages {
+		ollamaMsg := OllamaMessage{Role: msg.Role}
+
+		switch v := msg.Content.(type) {
+		case string:
+			ollamaMsg.Content = v
+		case []interface{}:
+			// Multi-part content: collect text parts only.
+			for _, part := range v {
+				if pm, ok := part.(map[string]interface{}); ok {
+					if pm["type"] == "text" {
+						if text, ok := pm["text"].(string); ok {
+							ollamaMsg.Content += text
+						}
+					}
+				}
+			}
+		}
+
+		if msg.Role == "tool" {
+			ollamaMsg.ToolName = msg.ToolCallID
+		}
+
+		if len(msg.ToolCalls) > 0 {
+			ollamaMsg.ToolCalls = make([]OllamaToolCall, len(msg.ToolCalls))
+			for i, tc := range msg.ToolCalls {
+				var args json.RawMessage
+				if tc.Function.Arguments != "" {
+					args = json.RawMessage(tc.Function.Arguments)
+				}
+				ollamaMsg.ToolCalls[i] = OllamaToolCall{
+					Function: OllamaToolFunction{
+						Name:      tc.Function.Name,
+						Arguments: args,
+					},
+				}
+			}
+		}
+
+		ollamaReq.Messages = append(ollamaReq.Messages, ollamaMsg)
+	}
+
+	if len(req.Tools) > 0 {
+		ollamaReq.Tools = make([]OllamaTool, len(req.Tools))
+		for i, t := range req.Tools {
+			ollamaReq.Tools[i] = OllamaTool{
+				Type: t.Type,
+				Function: OllamaToolFunctionDef{
+					Name:        t.Function.Name,
+					Description: t.Function.Description,
+					Parameters:  t.Function.Parameters,
+				},
+			}
+		}
+	}
+
+	return ollamaReq
+}
+
 func IsMiniMaxModel(modelID string) bool {
 	return modelID == "minimax-m2.5" || modelID == "minimax-m2.7"
+}
+
+// IsAnthropicOnlyModel returns true for models that only support the Anthropic
+// messages API and return an error on the OpenAI-compatible /chat/completions
+// endpoint ("not supported for format oa-compat").
+func IsAnthropicOnlyModel(modelID string) bool {
+	return modelID == "qwen3.7-max"
 }
 
 func MapModelsToOllama(models []client.Model) []map[string]interface{} {
