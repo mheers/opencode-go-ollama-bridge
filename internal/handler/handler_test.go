@@ -417,6 +417,62 @@ func TestParseTaggedAssistantContent_DeepSeekDSMLStyle(t *testing.T) {
 	}
 }
 
+func TestParseTaggedAssistantContent_PluralToolCallsEmpty(t *testing.T) {
+	// hy3-preview emits an empty <tool_calls> block when it attempts a call.
+	in := "Now, let me lint the Go files:<tool_calls>\n\n</tool_calls>"
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_calls>") {
+		t.Fatalf("clean content still has <tool_calls> markup: %q", clean)
+	}
+	if !strings.Contains(clean, "Now, let me lint the Go files") {
+		t.Fatalf("visible text was eaten: %q", clean)
+	}
+	if len(toolCalls) != 0 {
+		t.Fatalf("expected 0 tool calls from empty block, got %d", len(toolCalls))
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralToolCallsJSON(t *testing.T) {
+	in := `Let me list the files.<tool_calls>[{"name":"list_files","arguments":{"path":"/tmp"}}]</tool_calls>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_calls>") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "list_files" {
+		t.Fatalf("unexpected tool name: %+v", fn)
+	}
+}
+
+func TestParseTaggedAssistantContent_PluralToolCallsInvokeStyle(t *testing.T) {
+	in := `<tool_calls><invoke name="run_in_terminal"><command>go vet ./...</command></invoke></tool_calls>`
+
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if clean != "" {
+		t.Fatalf("expected empty visible content, got: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d", len(toolCalls))
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "run_in_terminal" {
+		t.Fatalf("expected run_in_terminal, got %+v", fn)
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]string
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	if parsed["command"] != "go vet ./..." {
+		t.Fatalf("unexpected command: %q", parsed["command"])
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

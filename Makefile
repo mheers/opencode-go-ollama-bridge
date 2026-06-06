@@ -1,4 +1,4 @@
-.PHONY: build test lint clean docker-build probe probe-stream
+.PHONY: build test lint clean docker-build probe probe-stream probe-json probe-multi probe-single
 
 BINARY_NAME=opencode-go-ollama-bridge
 DOCKER_IMAGE=opencode-go-ollama-bridge
@@ -26,6 +26,14 @@ probe-stream:
 # probe-json: same but prints the full raw JSON response per model.
 probe-json:
 	go run ./cmd/probe --json
+
+# probe-single: single-turn only (no multi-turn follow-up).
+probe-single:
+	go run ./cmd/probe --single-only
+
+# probe-multi: run both single-turn and multi-turn probes.
+probe-multi:
+	go run ./cmd/probe
 
 lint:
 	go vet ./...

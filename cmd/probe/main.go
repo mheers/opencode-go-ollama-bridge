@@ -1,7 +1,13 @@
-// probe is a diagnostic tool that sends a standardised tool-calling request to
+// probe is a diagnostic tool that sends standardised tool-calling requests to
 // every available model on the upstream OpenCode Go API and prints the raw
-// response.  This helps discover and document non-standard tool-call markup
-// formats so that corresponding adapters can be written in the bridge.
+// responses.  It runs two rounds per model:
+//
+//  1. Single-turn: bare tool-call request (tells us the basic format).
+//  2. Multi-turn:  injects a fake tool result and asks the model to continue
+//     (reveals how models behave in a real agentic conversation where they have
+//     already called a tool once).
+//
+// Results are saved to probe-results/<model>.<turn>.<backend>.json.
 //
 // Usage:
 //
@@ -31,12 +37,13 @@ var (
 	flagTimeout    time.Duration
 	flagOutputJSON bool
 	flagOutputDir  string
+	flagSingleOnly bool
 )
 
 func main() {
 	root := &cobra.Command{
 		Use:   "probe",
-		Short: "Probe each model with a tool-calling request and print the raw upstream response",
+		Short: "Probe each model with tool-calling requests (single-turn + multi-turn) and print results",
 		RunE:  run,
 	}
 
@@ -47,6 +54,7 @@ func main() {
 	root.Flags().DurationVar(&flagTimeout, "timeout", 90*time.Second, "Per-model request timeout")
 	root.Flags().BoolVar(&flagOutputJSON, "json", false, "Print raw JSON response for each model (default: pretty summary)")
 	root.Flags().StringVar(&flagOutputDir, "output-dir", "probe-results", "Directory to save per-model raw JSON results (empty string to disable)")
+	root.Flags().BoolVar(&flagSingleOnly, "single-only", false, "Only run the single-turn probe (skip multi-turn)")
 
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -72,12 +80,15 @@ func run(_ *cobra.Command, _ []string) error {
 	}
 
 	type result struct {
-		model    string
-		backend  string
-		duration time.Duration
-		summary  modelSummary
-		rawBody  []byte
-		err      error
+		model       string
+		backend     string
+		duration    time.Duration
+		single      modelSummary
+		multiTurn   modelSummary
+		singleRaw   []byte
+		multiRaw    []byte
+		singleErr   error
+		multiErr    error
 	}
 	results := make([]result, 0, len(models))
 
@@ -85,63 +96,95 @@ func run(_ *cobra.Command, _ []string) error {
 
 	for _, model := range models {
 		fmt.Printf("\n%s\n▶  Probing model: %s\n%s\n", sep, model, sep)
+		r := result{model: model, backend: "openai"}
 
+		// ── Round 1: single-turn ──────────────────────────────────────────────
+		fmt.Printf("  [round 1] single-turn tool call…\n")
 		start := time.Now()
-		raw, summary, probeErr := probeModel(baseURL, model)
-		dur := time.Since(start)
-		backend := "openai"
+		r.singleRaw, r.single, r.singleErr = probeModel(baseURL, model)
+		r.duration = time.Since(start)
 
-		if probeErr != nil && isOACompatError(probeErr) {
-			fmt.Printf("   OpenAI path failed (%v), retrying via Anthropic messages API…\n", probeErr)
+		if r.singleErr != nil && isOACompatError(r.singleErr) {
+			fmt.Printf("   OpenAI path failed, retrying via Anthropic messages API…\n")
 			start = time.Now()
-			raw, summary, probeErr = probeModelAnthropic(baseURL, model)
-			dur = time.Since(start)
-			backend = "anthropic"
+			r.singleRaw, r.single, r.singleErr = probeModelAnthropic(baseURL, model)
+			r.duration = time.Since(start)
+			r.backend = "anthropic"
 		}
 
-		if probeErr != nil {
-			fmt.Printf("   ERROR: %v\n", probeErr)
+		if r.singleErr != nil {
+			fmt.Printf("   ERROR (round 1): %v\n", r.singleErr)
 		} else {
-			fmt.Printf("  backend    : %s\n", backend)
-			printSummary(model, summary)
-			if flagOutputJSON {
-				fmt.Printf("\n--- RAW RESPONSE ---\n%s\n", indentJSON(raw))
-			}
+			printSummary("single", r.single)
+			saveResult(model, "single", r.backend, r.singleRaw)
 		}
 
-		if flagOutputDir != "" && len(raw) > 0 {
-			filename := flagOutputDir + "/" + strings.ReplaceAll(model, "/", "_") + "." + backend + ".json"
-			if writeErr := os.WriteFile(filename, []byte(indentJSON(raw)), 0o644); writeErr != nil {
-				fmt.Printf("   WARN: failed to save result to %s: %v\n", filename, writeErr)
+		// ── Round 2: multi-turn with injected tool result ─────────────────────
+		if !flagSingleOnly && r.singleErr == nil && r.single.hasToolCalls {
+			fmt.Printf("  [round 2] multi-turn (injecting fake tool result)…\n")
+			start = time.Now()
+			if r.backend == "anthropic" {
+				r.multiRaw, r.multiTurn, r.multiErr = probeMultiTurnAnthropic(baseURL, model, r.single.toolNames)
 			} else {
-				fmt.Printf("  saved      : %s\n", filename)
+				r.multiRaw, r.multiTurn, r.multiErr = probeMultiTurn(baseURL, model, r.single.toolNames)
+			}
+			r.duration += time.Since(start)
+			if r.multiErr != nil {
+				fmt.Printf("   ERROR (round 2): %v\n", r.multiErr)
+			} else {
+				printSummary("multi ", r.multiTurn)
+				saveResult(model, "multi", r.backend, r.multiRaw)
 			}
 		}
 
-		results = append(results, result{
-			model: model, backend: backend, duration: dur, summary: summary, rawBody: raw, err: probeErr,
-		})
+		if flagOutputJSON && len(r.singleRaw) > 0 {
+			fmt.Printf("\n--- RAW (round 1) ---\n%s\n", indentJSON(r.singleRaw))
+		}
+		if flagOutputJSON && len(r.multiRaw) > 0 {
+			fmt.Printf("\n--- RAW (round 2) ---\n%s\n", indentJSON(r.multiRaw))
+		}
+
+		results = append(results, r)
 	}
 
+	// ── Compatibility table ───────────────────────────────────────────────────
 	fmt.Printf("\n%s\n  COMPATIBILITY TABLE\n%s\n", sep, sep)
-	fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n", "MODEL", "BACKEND", "LATENCY", "TOOL_CALLS", "REASONING", "FORMAT DETECTED")
-	fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n",
-		strings.Repeat("-", 30), strings.Repeat("-", 9), strings.Repeat("-", 8),
-		strings.Repeat("-", 10), strings.Repeat("-", 10), strings.Repeat("-", 24))
+	fmt.Printf("%-28s  %-9s  %-22s  %-22s\n", "MODEL", "BACKEND", "ROUND-1 FORMAT", "ROUND-2 FORMAT")
+	fmt.Printf("%-28s  %-9s  %-22s  %-22s\n",
+		strings.Repeat("-", 28), strings.Repeat("-", 9), strings.Repeat("-", 22), strings.Repeat("-", 22))
 	for _, r := range results {
-		if r.err != nil {
-			fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n",
-				r.model, r.backend, fmtDur(r.duration), "ERROR", "ERROR", r.err.Error())
-			continue
+		r1fmt := "ERROR"
+		r2fmt := "(skipped)"
+		if r.singleErr == nil {
+			r1fmt = r.single.formatTag
 		}
-		fmt.Printf("%-30s  %-9s  %-8s  %-10s  %-10s  %s\n",
-			r.model, r.backend, fmtDur(r.duration),
-			boolMark(r.summary.hasToolCalls), boolMark(r.summary.hasReasoning),
-			r.summary.formatTag)
+		if r.multiErr == nil && len(r.multiRaw) > 0 {
+			r2fmt = r.multiTurn.formatTag
+		} else if r.multiErr != nil {
+			r2fmt = "ERROR"
+		}
+		fmt.Printf("%-28s  %-9s  %-22s  %-22s\n", r.model, r.backend, truncate(r1fmt, 22), truncate(r2fmt, 22))
 	}
 	fmt.Println()
 	return nil
 }
+
+func saveResult(model, turn, backend string, raw []byte) {
+	if flagOutputDir == "" || len(raw) == 0 {
+		return
+	}
+	filename := fmt.Sprintf("%s/%s.%s.%s.json",
+		flagOutputDir, strings.ReplaceAll(model, "/", "_"), turn, backend)
+	if err := os.WriteFile(filename, []byte(indentJSON(raw)), 0o644); err != nil {
+		fmt.Printf("   WARN: could not save %s: %v\n", filename, err)
+	} else {
+		fmt.Printf("  saved      : %s\n", filename)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model resolution
+// ─────────────────────────────────────────────────────────────────────────────
 
 func resolveModels(baseURL string) ([]string, error) {
 	if flagModels != "" {
@@ -188,6 +231,10 @@ func resolveModels(baseURL string) ([]string, error) {
 	return out, nil
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-model probes
+// ─────────────────────────────────────────────────────────────────────────────
+
 type modelSummary struct {
 	hasToolCalls bool
 	hasReasoning bool
@@ -204,35 +251,40 @@ func isOACompatError(err error) bool {
 	return strings.Contains(s, "oa-compat") || strings.Contains(s, "not supported for format")
 }
 
-func probeModel(baseURL, model string) ([]byte, modelSummary, error) {
-	bodyBytes, err := json.Marshal(buildProbeRequest(model, flagStream))
+func doPost(url string, headers map[string]string, body interface{}) ([]byte, int, error) {
+	bodyBytes, err := json.Marshal(body)
 	if err != nil {
-		return nil, modelSummary{}, err
+		return nil, 0, err
 	}
-
 	httpClient := &http.Client{Timeout: flagTimeout}
-	req, err := http.NewRequest("POST", baseURL+"/chat/completions", bytes.NewReader(bodyBytes))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return nil, modelSummary{}, err
+		return nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+flagAPIKey)
-
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, modelSummary{}, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-
 	raw, err := io.ReadAll(resp.Body)
+	return raw, resp.StatusCode, err
+}
+
+// probeModel sends a fresh single-turn tool-calling request via /chat/completions.
+func probeModel(baseURL, model string) ([]byte, modelSummary, error) {
+	raw, code, err := doPost(baseURL+"/chat/completions",
+		map[string]string{"Authorization": "Bearer " + flagAPIKey},
+		buildProbeRequest(model, flagStream))
 	if err != nil {
 		return nil, modelSummary{}, err
 	}
-
-	if resp.StatusCode >= 400 {
-		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
+	if code >= 400 {
+		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", code, truncate(string(raw), 200))
 	}
-
 	var summary modelSummary
 	if flagStream {
 		summary = analyseSSE(raw)
@@ -242,6 +294,59 @@ func probeModel(baseURL, model string) ([]byte, modelSummary, error) {
 	return raw, summary, nil
 }
 
+// probeMultiTurn continues the conversation after a fake tool result is injected.
+// It sends: user → assistant(tool_call) → tool(result) → user(follow-up).
+func probeMultiTurn(baseURL, model string, calledTools []string) ([]byte, modelSummary, error) {
+	toolName := "list_files"
+	if len(calledTools) > 0 {
+		toolName = calledTools[0]
+	}
+
+	// Build the history: user → assistant with tool call → tool result → follow-up user.
+	messages := []map[string]interface{}{
+		{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
+		{
+			"role": "assistant",
+			"content": nil,
+			"tool_calls": []map[string]interface{}{
+				{
+					"id":   "call_probe_1",
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      toolName,
+						"arguments": `{"path":"/tmp"}`,
+					},
+				},
+			},
+		},
+		{
+			"role":         "tool",
+			"tool_call_id": "call_probe_1",
+			"content":      "file1.txt\nfile2.go\nREADME.md",
+		},
+		{"role": "user", "content": "Now read the contents of file1.txt using the read_file tool."},
+	}
+
+	reqBody := buildProbeRequestWithMessages(model, messages, flagStream)
+	raw, code, err := doPost(baseURL+"/chat/completions",
+		map[string]string{"Authorization": "Bearer " + flagAPIKey},
+		reqBody)
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+	if code >= 400 {
+		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", code, truncate(string(raw), 200))
+	}
+	var summary modelSummary
+	if flagStream {
+		summary = analyseSSE(raw)
+	} else {
+		summary = analyseJSON(raw)
+	}
+	return raw, summary, nil
+}
+
+// probeModelAnthropic probes a model via the Anthropic /messages endpoint.
 func probeModelAnthropic(baseURL, model string) ([]byte, modelSummary, error) {
 	type Tool struct {
 		Name        string      `json:"name"`
@@ -268,39 +373,117 @@ func probeModelAnthropic(baseURL, model string) ([]byte, modelSummary, error) {
 		},
 	}
 
-	bodyBytes, err := json.Marshal(reqBody)
+	raw, code, err := doPost(baseURL+"/messages",
+		map[string]string{
+			"x-api-key":         flagAPIKey,
+			"anthropic-version": "2023-06-01",
+		}, reqBody)
 	if err != nil {
 		return nil, modelSummary{}, err
 	}
-
-	httpClient := &http.Client{Timeout: flagTimeout}
-	req, err := http.NewRequest("POST", baseURL+"/messages", bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, modelSummary{}, err
+	if code >= 400 {
+		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", code, truncate(string(raw), 200))
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", flagAPIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, modelSummary{}, err
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, modelSummary{}, err
-	}
-
-	if resp.StatusCode >= 400 {
-		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
-	}
-
 	return raw, analyseAnthropicJSON(raw), nil
 }
 
+// probeMultiTurnAnthropic runs a multi-turn test via the Anthropic messages API.
+func probeMultiTurnAnthropic(baseURL, model string, calledTools []string) ([]byte, modelSummary, error) {
+	toolName := "list_files"
+	if len(calledTools) > 0 {
+		toolName = calledTools[0]
+	}
+
+	type Tool struct {
+		Name        string      `json:"name"`
+		Description string      `json:"description"`
+		InputSchema interface{} `json:"input_schema"`
+	}
+	tools := []Tool{
+		{
+			Name:        "list_files",
+			Description: "List the files in a given directory path on the local filesystem.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"path"},
+			},
+		},
+		{
+			Name:        "read_file",
+			Description: "Read the contents of a file at the given path.",
+			InputSchema: map[string]interface{}{
+				"type": "object",
+				"properties": map[string]interface{}{
+					"path": map[string]interface{}{"type": "string"},
+				},
+				"required": []string{"path"},
+			},
+		},
+	}
+
+	messages := []map[string]interface{}{
+		{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
+		{
+			"role": "assistant",
+			"content": []map[string]interface{}{
+				{
+					"type":  "tool_use",
+					"id":    "toolu_probe_1",
+					"name":  toolName,
+					"input": map[string]string{"path": "/tmp"},
+				},
+			},
+		},
+		{
+			"role": "user",
+			"content": []map[string]interface{}{
+				{
+					"type":        "tool_result",
+					"tool_use_id": "toolu_probe_1",
+					"content":     "file1.txt\nfile2.go\nREADME.md",
+				},
+			},
+		},
+		{"role": "user", "content": "Now read the contents of file1.txt using the read_file tool."},
+	}
+
+	reqBody := map[string]interface{}{
+		"model":      model,
+		"max_tokens": 1024,
+		"stream":     false,
+		"tools":      tools,
+		"messages":   messages,
+	}
+
+	raw, code, err := doPost(baseURL+"/messages",
+		map[string]string{
+			"x-api-key":         flagAPIKey,
+			"anthropic-version": "2023-06-01",
+		}, reqBody)
+	if err != nil {
+		return nil, modelSummary{}, err
+	}
+	if code >= 400 {
+		return raw, modelSummary{}, fmt.Errorf("HTTP %d: %s", code, truncate(string(raw), 200))
+	}
+	return raw, analyseAnthropicJSON(raw), nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Request builders
+// ─────────────────────────────────────────────────────────────────────────────
+
 func buildProbeRequest(model string, stream bool) map[string]interface{} {
+	return buildProbeRequestWithMessages(model,
+		[]map[string]interface{}{
+			{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
+		}, stream)
+}
+
+func buildProbeRequestWithMessages(model string, messages []map[string]interface{}, stream bool) map[string]interface{} {
 	return map[string]interface{}{
 		"model":  model,
 		"stream": stream,
@@ -340,11 +523,13 @@ func buildProbeRequest(model string, stream bool) map[string]interface{} {
 				},
 			},
 		},
-		"messages": []map[string]interface{}{
-			{"role": "user", "content": "Please list the files in the /tmp directory using the list_files tool."},
-		},
+		"messages": messages,
 	}
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Response analysers
+// ─────────────────────────────────────────────────────────────────────────────
 
 func analyseJSON(raw []byte) modelSummary {
 	var payload map[string]interface{}
@@ -442,6 +627,9 @@ func analyseSSE(raw []byte) modelSummary {
 				contentBuf.WriteString(v)
 			}
 			if v, ok := delta["reasoning_content"].(string); ok {
+				reasonBuf.WriteString(v)
+			}
+			if v, ok := delta["reasoning"].(string); ok {
 				reasonBuf.WriteString(v)
 			}
 			if dTCs, ok := delta["tool_calls"].([]interface{}); ok {
@@ -568,10 +756,29 @@ func detectTagFormat(content string) string {
 		return ""
 	}
 	if strings.Contains(content, "｜｜DSML｜｜tool_calls") {
-		return "deepseek DSML (<｜｜DSML｜｜tool_calls>)"
+		return "deepseek DSML"
 	}
 	if strings.Contains(content, "]<]minimax[>[") {
-		return "minimax wrapped (<tool_call> + ]<]minimax[>[)"
+		return "minimax wrapped <tool_call>"
+	}
+	if strings.Contains(content, "<tool_calls>") {
+		inner := ""
+		if i := strings.Index(content, "<tool_calls>"); i >= 0 {
+			end := strings.Index(content[i:], "</tool_calls>")
+			if end >= 0 {
+				inner = strings.TrimSpace(content[i+len("<tool_calls>") : i+end])
+			}
+		}
+		if inner == "" {
+			return "<tool_calls> (plural, empty)"
+		}
+		if strings.HasPrefix(inner, "[") {
+			return "<tool_calls>[json]</tool_calls>"
+		}
+		if strings.Contains(inner, "<invoke") {
+			return "<tool_calls><invoke> style"
+		}
+		return "<tool_calls> (plural, unknown inner)"
 	}
 	if strings.Contains(content, "<tool_call>") || strings.Contains(content, "<tool_call ") {
 		if strings.Contains(content, "<invoke") {
@@ -580,23 +787,26 @@ func detectTagFormat(content string) string {
 		if strings.Contains(content, "<function ") {
 			return "<tool_call><function name> style"
 		}
-		return "<tool_call>{json}</tool_call> style"
+		return "<tool_call>{json}</tool_call>"
 	}
 	if strings.Contains(content, "[") && strings.Contains(content, "{") {
-		return "bracket call [name {json}] style"
+		return "bracket call [name {json}]"
 	}
 	return ""
 }
 
-func printSummary(_ string, s modelSummary) {
-	fmt.Printf("  tool_calls : %s\n", boolMark(s.hasToolCalls))
-	fmt.Printf("  reasoning  : %s\n", boolMark(s.hasReasoning))
-	fmt.Printf("  format     : %s\n", s.formatTag)
+// ─────────────────────────────────────────────────────────────────────────────
+// Output helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+func printSummary(label string, s modelSummary) {
+	fmt.Printf("  [%s] tool_calls=%s  reasoning=%s  format=%s\n",
+		label, boolMark(s.hasToolCalls), boolMark(s.hasReasoning), s.formatTag)
 	if len(s.toolNames) > 0 {
-		fmt.Printf("  tools used : %s\n", strings.Join(s.toolNames, ", "))
+		fmt.Printf("  [%s] tools used : %s\n", label, strings.Join(s.toolNames, ", "))
 	}
 	if s.contentSnip != "" {
-		fmt.Printf("  content    : %s\n", s.contentSnip)
+		fmt.Printf("  [%s] content    : %s\n", label, s.contentSnip)
 	}
 }
 

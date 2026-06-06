@@ -40,6 +40,13 @@ var (
 	dsmlInvokeRE         = regexp.MustCompile(`(?is)<` + dsmlSep + `invoke\s+name="([^"]+)">(.*?)</` + dsmlSep + `invoke>`)
 	dsmlParamRE          = regexp.MustCompile(`(?is)<` + dsmlSep + `parameter\s+name="([^"]+)"[^>]*>(.*?)</` + dsmlSep + `parameter>`)
 	dsmlToolCallsTailRE  = regexp.MustCompile(`(?is)<` + dsmlSep + `tool_calls>.*$`)
+
+	// <tool_calls>…</tool_calls> (plural, no word-boundary) — used by hy3-preview
+	// and possibly others routing via OpenRouter. May contain JSON, invoke-style
+	// sub-tags, or be completely empty.
+	toolCallsPluralInnerRE = regexp.MustCompile(`(?is)<tool_calls>(.*?)</tool_calls>`)
+	toolCallsPluralBlockRE = regexp.MustCompile(`(?is)<tool_calls>.*?</tool_calls>`)
+	toolCallsPluralTailRE  = regexp.MustCompile(`(?is)<tool_calls>.*$`)
 )
 
 type Handler struct {
@@ -783,9 +790,11 @@ func sanitizeTaggedText(s string) string {
 	s = miniMaxWrapperRE.ReplaceAllString(s, "")
 	s = thinkBlockRE.ReplaceAllString(s, "")
 	s = toolCallBlockRE.ReplaceAllString(s, "")
+	s = toolCallsPluralBlockRE.ReplaceAllString(s, "")
 	s = dsmlToolCallsBlockRE.ReplaceAllString(s, "")
 	s = thinkTailRE.ReplaceAllString(s, "")
 	s = toolCallTailRE.ReplaceAllString(s, "")
+	s = toolCallsPluralTailRE.ReplaceAllString(s, "")
 	s = dsmlToolCallsTailRE.ReplaceAllString(s, "")
 	s = strings.TrimSpace(s)
 	s = multiBlankRE.ReplaceAllString(s, "\n\n")
@@ -796,6 +805,123 @@ func parseTaggedAssistantContent(content string) (string, []map[string]interface
 	clean := sanitizeTaggedText(content)
 	toolCalls := extractToolCalls(content)
 	return clean, toolCalls
+}
+
+// extractPluralToolCalls handles the <tool_calls>…</tool_calls> (plural) format
+// used by hy3-preview and other models routed via OpenRouter.
+//
+// The inner content can be:
+//   - A JSON array: [{"name":"fn","arguments":{…}}] or the full OpenAI shape
+//   - Invoke-style sub-tags: <invoke name="fn">…</invoke>
+//   - Empty (model attempted a call but emitted nothing) → returns nil
+func extractPluralToolCalls(raw string) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0)
+	callIdx := 0
+
+	for _, blockMatch := range toolCallsPluralInnerRE.FindAllStringSubmatch(raw, -1) {
+		if len(blockMatch) < 2 {
+			continue
+		}
+		inner := strings.TrimSpace(blockMatch[1])
+		if inner == "" {
+			continue
+		}
+
+		// Try JSON array first.
+		dec := json.NewDecoder(strings.NewReader(inner))
+		var arr []interface{}
+		if err := dec.Decode(&arr); err == nil {
+			for _, item := range arr {
+				obj, ok := item.(map[string]interface{})
+				if !ok {
+					continue
+				}
+				name := ""
+				if n, ok := obj["name"].(string); ok {
+					name = n
+				} else if fn, ok := obj["function"].(map[string]interface{}); ok {
+					name, _ = fn["name"].(string)
+				}
+				if name == "" {
+					continue
+				}
+				argsJSON := "{}"
+				if a, ok := obj["arguments"]; ok {
+					switch v := a.(type) {
+					case string:
+						if json.Valid([]byte(v)) {
+							argsJSON = v
+						} else if b, err := json.Marshal(v); err == nil {
+							argsJSON = string(b)
+						}
+					default:
+						if b, err := json.Marshal(v); err == nil {
+							argsJSON = string(b)
+						}
+					}
+				} else if p, ok := obj["parameters"]; ok {
+					if b, err := json.Marshal(p); err == nil {
+						argsJSON = string(b)
+					}
+				}
+				id := fmt.Sprintf("call_%d", callIdx)
+				if rawID, ok := obj["id"].(string); ok && rawID != "" {
+					id = rawID
+				}
+				out = append(out, map[string]interface{}{
+					"id":   id,
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": argsJSON,
+					},
+				})
+				callIdx++
+			}
+			continue
+		}
+
+		// Fall back to invoke-style sub-tags (same as minimax handler).
+		for _, im := range invokeTagRE.FindAllStringSubmatch(inner, -1) {
+			if len(im) < 3 {
+				continue
+			}
+			name := strings.TrimSpace(im[1])
+			if !bareCallNameRE.MatchString(strings.ToLower(name)) {
+				continue
+			}
+			params := map[string]string{}
+			if cm := commandTagRE.FindStringSubmatch(im[2]); len(cm) >= 2 {
+				params["command"] = strings.TrimSpace(cm[1])
+			}
+			for _, pm := range parameterTagRE.FindAllStringSubmatch(im[2], -1) {
+				if len(pm) < 3 {
+					continue
+				}
+				if k := strings.TrimSpace(pm[1]); k != "" {
+					params[k] = strings.TrimSpace(pm[2])
+				}
+			}
+			argsJSON := "{}"
+			if b, err := json.Marshal(params); err == nil {
+				argsJSON = string(b)
+			}
+			out = append(out, map[string]interface{}{
+				"id":   fmt.Sprintf("call_%d", callIdx),
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":      name,
+					"arguments": argsJSON,
+				},
+			})
+			callIdx++
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // extractDSMLToolCalls handles DeepSeek's DSML markup format:
@@ -864,6 +990,15 @@ func extractToolCalls(raw string) []map[string]interface{} {
 	// DeepSeek DSML format: <｜｜DSML｜｜tool_calls>...<｜｜DSML｜｜invoke name="fn">...<｜｜DSML｜｜invoke>...
 	if dsmlMatches := dsmlToolCallsBlockRE.FindAllStringSubmatch(raw, -1); len(dsmlMatches) > 0 {
 		return extractDSMLToolCalls(raw)
+	}
+
+	// <tool_calls>…</tool_calls> (plural) — hy3-preview / OpenRouter models.
+	if toolCallsPluralInnerRE.MatchString(raw) {
+		if tcs := extractPluralToolCalls(raw); len(tcs) > 0 {
+			return tcs
+		}
+		// Block was present but empty — return nil so caller strips it cleanly.
+		return nil
 	}
 
 	matches := toolCallInnerRE.FindAllStringSubmatch(raw, -1)
