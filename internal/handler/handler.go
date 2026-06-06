@@ -59,6 +59,10 @@ var (
 
 	// <arg_key>name</arg_key> <arg_value>value</arg_value> — hy3-preview argument format.
 	argPairRE = regexp.MustCompile(`(?is)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>`)
+
+	// Detects unquoted JavaScript object keys (e.g. { tool: "name", args: {...} })
+	// Only matches an identifier key that is NOT preceded by a quote character.
+	unquotedKeyRE = regexp.MustCompile(`([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)(\s*:)`)
 )
 
 type Handler struct {
@@ -1101,6 +1105,28 @@ func extractPluralToolCalls(raw string) []map[string]interface{} {
 	return out
 }
 
+// normalizeJSObject quotes unquoted JS object keys so the result can be
+// parsed by encoding/json.  It handles the MiniMax-M3 format:
+//
+//	{ tool: "name", args: { "key": "value" } }
+//
+// Only top-level-like unquoted keys (after { or ,) are affected; keys that
+// are already preceded by a quote character are left alone.
+func normalizeJSObject(s string) string {
+	// Replace  {key:  and  ,key:  where key is a bare identifier not preceded
+	// by a quote.  The replacement adds quotes around the key.
+	result := unquotedKeyRE.ReplaceAllStringFunc(s, func(match string) string {
+		// match is like ",  key  :" – capture groups are groups 1,2,3.
+		m := unquotedKeyRE.FindStringSubmatch(match)
+		if len(m) < 4 {
+			return match
+		}
+		// m[1]=prefix ({,), m[2]=key, m[3]=: suffix
+		return m[1] + `"` + m[2] + `"` + m[3]
+	})
+	return result
+}
+
 // splitOnToolCallTag splits s on every occurrence of "<tool_call>" (case-insensitive)
 // and returns the segments that follow each opener (the first empty segment before
 // the first opener is dropped).
@@ -1227,6 +1253,20 @@ func extractToolCalls(raw string) []map[string]interface{} {
 
 	matches := toolCallInnerRE.FindAllStringSubmatch(raw, -1)
 	if len(matches) == 0 {
+		// No closed </tool_call> — try tail variant (opener to end of string).
+		// MiniMax-M3 doesn't emit </tool_call>.
+		if tail := toolCallTailRE.FindString(raw); tail != "" {
+			// Strip the opener tag itself to get inner content.
+			openerEnd := strings.Index(tail, ">")
+			if openerEnd >= 0 {
+				inner := strings.TrimSpace(tail[openerEnd+1:])
+				if inner != "" {
+					matches = [][]string{{"", inner}}
+				}
+			}
+		}
+	}
+	if len(matches) == 0 {
 		return nil
 	}
 
@@ -1242,6 +1282,8 @@ func extractToolCalls(raw string) []map[string]interface{} {
 			continue
 		}
 
+		callsBeforeBlock := len(out)
+
 		dec := json.NewDecoder(strings.NewReader(inner))
 		parsedAny := false
 		for {
@@ -1256,8 +1298,35 @@ func extractToolCalls(raw string) []map[string]interface{} {
 				name = n
 			} else if fn, ok := obj["function"].(map[string]interface{}); ok {
 				name, _ = fn["name"].(string)
+			} else if t, ok := obj["tool"].(string); ok {
+				// MiniMax-M3: { tool: "name", args: {...} }
+				name = t
 			}
 			if name == "" {
+				// MiniMax stream style may emit bare object calls:
+				// {file_search:{...}} {read_file:{...}}
+				if len(obj) == 1 {
+					for k, v := range obj {
+						candidate := strings.TrimSpace(k)
+						if bareCallNameRE.MatchString(strings.ToLower(candidate)) {
+							name = candidate
+							if b, err := json.Marshal(v); err == nil {
+								out = append(out, map[string]interface{}{
+									"id":   fmt.Sprintf("call_%d", callIdx),
+									"type": "function",
+									"function": map[string]interface{}{
+										"name":      name,
+										"arguments": string(b),
+									},
+								})
+								callIdx++
+							}
+						}
+					}
+				}
+				if len(out) > callsBeforeBlock {
+					continue
+				}
 				continue
 			}
 
@@ -1275,6 +1344,20 @@ func extractToolCalls(raw string) []map[string]interface{} {
 						if b, err := json.Marshal(v); err == nil {
 							argsJSON = string(b)
 						}
+					}
+				default:
+					if b, err := json.Marshal(v); err == nil {
+						argsJSON = string(b)
+					}
+				}
+			} else if a, ok := obj["args"]; ok {
+				// MiniMax-M3: args key instead of arguments
+				switch v := a.(type) {
+				case string:
+					if json.Valid([]byte(v)) {
+						argsJSON = v
+					} else if b, err := json.Marshal(v); err == nil {
+						argsJSON = string(b)
 					}
 				default:
 					if b, err := json.Marshal(v); err == nil {
@@ -1301,7 +1384,92 @@ func extractToolCalls(raw string) []map[string]interface{} {
 			callIdx++
 		}
 
-		if parsedAny {
+		if parsedAny && len(out) > callsBeforeBlock {
+			continue
+		}
+
+		// JSON parse failed — try normalizing JavaScript-style object syntax
+		// where keys may be unquoted: { tool: "name", args: {...} }
+		// This is the MiniMax-M3 format as of 2026-06.
+		if normalized := normalizeJSObject(inner); normalized != inner {
+			dec2 := json.NewDecoder(strings.NewReader(normalized))
+			for {
+				var obj map[string]interface{}
+				if err := dec2.Decode(&obj); err != nil {
+					break
+				}
+				parsedAny = true
+
+				name := ""
+				if n, ok := obj["name"].(string); ok {
+					name = n
+				} else if fn, ok := obj["function"].(map[string]interface{}); ok {
+					name, _ = fn["name"].(string)
+				} else if t, ok := obj["tool"].(string); ok {
+					name = t
+				}
+				if name == "" {
+					if len(obj) == 1 {
+						for k, v := range obj {
+							candidate := strings.TrimSpace(k)
+							if bareCallNameRE.MatchString(strings.ToLower(candidate)) {
+								name = candidate
+								if b, err := json.Marshal(v); err == nil {
+									out = append(out, map[string]interface{}{
+										"id":   fmt.Sprintf("call_%d", callIdx),
+										"type": "function",
+										"function": map[string]interface{}{
+											"name":      name,
+											"arguments": string(b),
+										},
+									})
+									callIdx++
+								}
+							}
+						}
+					}
+					if len(out) > callsBeforeBlock {
+						continue
+					}
+					continue
+				}
+
+				argsJSON := "{}"
+				for _, key := range []string{"arguments", "args", "parameters"} {
+					if a, ok := obj[key]; ok {
+						switch v := a.(type) {
+						case string:
+							if json.Valid([]byte(v)) {
+								argsJSON = v
+							} else if b, err := json.Marshal(v); err == nil {
+								argsJSON = string(b)
+							}
+						default:
+							if b, err := json.Marshal(v); err == nil {
+								argsJSON = string(b)
+							}
+						}
+						break
+					}
+				}
+
+				id := fmt.Sprintf("call_%d", callIdx)
+				if rawID, ok := obj["id"].(string); ok && rawID != "" {
+					id = rawID
+				}
+				out = append(out, map[string]interface{}{
+					"id":   id,
+					"type": "function",
+					"function": map[string]interface{}{
+						"name":      name,
+						"arguments": argsJSON,
+					},
+				})
+				callIdx++
+			}
+		}
+
+		if parsedAny && len(out) > callsBeforeBlock {
 			continue
 		}
 

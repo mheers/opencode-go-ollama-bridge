@@ -264,6 +264,9 @@ func TestIsMiniMaxModel(t *testing.T) {
 	if !IsMiniMaxModel("minimax-m2.7") {
 		t.Error("minimax-m2.7 should be detected")
 	}
+	if !IsMiniMaxModel("minimax-m3") {
+		t.Error("minimax-m3 should be detected")
+	}
 	if IsMiniMaxModel("glm-5.1") {
 		t.Error("glm-5.1 should not be detected as minimax")
 	}

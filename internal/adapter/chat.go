@@ -3,6 +3,7 @@ package adapter
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/mheers/opencode-go-ollama-bridge/internal/client"
@@ -407,7 +408,8 @@ func OpenAIRequestToOllama(req *OpenAIRequest) *OllamaChatRequest {
 }
 
 func IsMiniMaxModel(modelID string) bool {
-	return modelID == "minimax-m2.5" || modelID == "minimax-m2.7"
+	modelID = strings.ToLower(strings.TrimSpace(modelID))
+	return strings.HasPrefix(modelID, "minimax-")
 }
 
 // IsAnthropicOnlyModel returns true for models that only support the Anthropic

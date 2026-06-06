@@ -615,6 +615,37 @@ func TestParseTaggedAssistantContent_PluralNestedArgKeyValueFormat(t *testing.T)
 	}
 }
 
+func TestParseTaggedAssistantContent_MiniMaxM3JSObjectFormat(t *testing.T) {
+	// MiniMax-M3 format: ]<]minimax[>[<tool_call> with JS-style unquoted keys.
+	// { tool: "name", args: { ... } }
+	in := `I'll explore the codebase.]<]minimax[>[<tool_call>
+{ tool: "manage_todo_list",args: { "todoList": [{"id":1,"title":"Explore","status":"in-progress"}] } }
+`
+	clean, toolCalls := parseTaggedAssistantContent(in)
+	if strings.Contains(clean, "<tool_call>") || strings.Contains(clean, "minimax") {
+		t.Fatalf("clean content still has markup: %q", clean)
+	}
+	if !strings.Contains(clean, "I'll explore") {
+		t.Fatalf("visible text was eaten: %q", clean)
+	}
+	if len(toolCalls) != 1 {
+		t.Fatalf("expected 1 tool call, got %d: %+v", len(toolCalls), toolCalls)
+	}
+	fn, _ := toolCalls[0]["function"].(map[string]interface{})
+	if fn["name"] != "manage_todo_list" {
+		t.Fatalf("expected manage_todo_list, got %q", fn["name"])
+	}
+	args, _ := fn["arguments"].(string)
+	var parsed map[string]interface{}
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		t.Fatalf("invalid arguments json: %v (%s)", err, args)
+	}
+	todos, _ := parsed["todoList"].([]interface{})
+	if len(todos) != 1 {
+		t.Fatalf("expected 1 todo, got %d", len(todos))
+	}
+}
+
 func newOpenAIV1Handler(t *testing.T, response string, stream bool) *Handler {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -881,12 +912,23 @@ func TestV1ChatCompletions_OpenAI_StreamPreservesNativeToolCalls(t *testing.T) {
 	}
 }
 
-func TestV1ChatCompletions_OpenAI_StreamMiniMaxInvokeSetsToolCallsFinish(t *testing.T) {
-	upstream := "data: {\"id\":\"mmx-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"]<]minimax[>[<tool_call>\\n]<]minimax[>[<invoke name=\\\"run_in_terminal\\\">]<]minimax[>[<command>cd /tmp/demo && git log --oneline</command\",\"role\":\"assistant\"}}],\"created\":1780734753,\"model\":\"MiniMax-M3\",\"object\":\"chat.completion.chunk\"}\n\n" +
-		"data: {\"id\":\"mmx-1\",\"choices\":[{\"index\":0,\"finish_reason\":\"stop\",\"delta\":{\"content\":\">]<]minimax[>[</invoke>\\n]<]minimax[>[</tool_call>\",\"role\":\"assistant\"}}],\"created\":1780734753,\"model\":\"MiniMax-M3\",\"object\":\"chat.completion.chunk\"}\n\n" +
-		"data: [DONE]\n\n"
+func TestV1ChatCompletions_MiniMaxM3_StreamInvokeSetsToolCallsFinish(t *testing.T) {
+	upstream := `{
+		"id":"mmx-1",
+		"object":"chat.completion",
+		"created":1780734753,
+		"model":"MiniMax-M3",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"run_in_terminal\">]<]minimax[>[<command>cd /tmp/demo && git log --oneline</command>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+			},
+			"finish_reason":"stop"
+		}]
+	}`
 
-	h := newOpenAIV1Handler(t, upstream, true)
+	h := newMiniMaxV1Handler(t, upstream)
 	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"check latest diff"}],"stream":true}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
@@ -900,6 +942,48 @@ func TestV1ChatCompletions_OpenAI_StreamMiniMaxInvokeSetsToolCallsFinish(t *test
 	bodyOut := w.Body.String()
 	if !strings.Contains(bodyOut, `"name":"run_in_terminal"`) {
 		t.Fatalf("expected run_in_terminal tool call in rewritten stream: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("expected finish_reason tool_calls in rewritten stream: %s", bodyOut)
+	}
+}
+
+func TestV1ChatCompletions_MiniMaxM3_StreamBareObjectToolCalls(t *testing.T) {
+	upstream := `{
+		"id":"mmx-obj-1",
+		"object":"chat.completion",
+		"created":1780743307,
+		"model":"MiniMax-M3",
+		"choices":[{
+			"index":0,
+			"message":{
+				"role":"assistant",
+				"content":"<think>reasoning</think>I will inspect files.]<]minimax[>[<tool_call>\n{file_search:{root:\"/tmp/repo\",pattern:\"**/*.go\"}}\n{read_file:{filepath:\"/tmp/repo/README.md\"}}\n"
+			},
+			"finish_reason":"stop"
+		}]
+	}`
+
+	h := newMiniMaxV1Handler(t, upstream)
+	body := `{"model":"minimax-m3","messages":[{"role":"user","content":"inspect repo"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	h.V1ChatCompletions()(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	bodyOut := w.Body.String()
+	if strings.Contains(bodyOut, "<think>") || strings.Contains(bodyOut, "<tool_call>") || strings.Contains(bodyOut, "]<]minimax[>") {
+		t.Fatalf("stream response still contains unsupported tags: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"name":"file_search"`) {
+		t.Fatalf("expected file_search tool call in rewritten stream: %s", bodyOut)
+	}
+	if !strings.Contains(bodyOut, `"name":"read_file"`) {
+		t.Fatalf("expected read_file tool call in rewritten stream: %s", bodyOut)
 	}
 	if !strings.Contains(bodyOut, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("expected finish_reason tool_calls in rewritten stream: %s", bodyOut)
