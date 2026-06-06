@@ -1,4 +1,4 @@
-.PHONY: build test lint clean docker-build
+.PHONY: build test lint clean docker-build probe probe-stream
 
 BINARY_NAME=opencode-go-ollama-bridge
 DOCKER_IMAGE=opencode-go-ollama-bridge
@@ -13,6 +13,19 @@ test:
 test-cover:
 	go test -v -count=1 -race -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
+
+# probe: query every model with a tool-calling prompt and print a compatibility table.
+# Requires OPENCODE_GO_API_KEY to be set.
+probe:
+	go run ./cmd/probe
+
+# probe-stream: same but uses streaming (SSE) mode.
+probe-stream:
+	go run ./cmd/probe --stream
+
+# probe-json: same but prints the full raw JSON response per model.
+probe-json:
+	go run ./cmd/probe --json
 
 lint:
 	go vet ./...
