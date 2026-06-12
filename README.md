@@ -1,6 +1,18 @@
-# opencode-go-ollama-bridge
+# opencode-go-ollama-bridge — DEPRECATED
+
+> **⚠️ This project is no longer maintained.**
+>
+> Use **[oc-go-provider-extension](https://github.com/mheers/oc-go-provider-extension)** instead — a VS Code extension that provides native model integration, removing the need for a standalone bridge process.
 
 A lightweight bridge that exposes an **Ollama-compatible HTTP API** and transparently forwards requests to the [OpenCode Go](https://opencode.ai) API. This lets any tool that already speaks the Ollama protocol (Open WebUI, Continue.dev, Cursor, LM Studio, …) work out-of-the-box with OpenCode Go's models.
+
+## Migrating
+
+If you're currently using this bridge, you can switch to the VS Code extension:
+
+1. Install **[oc-go-provider-extension](https://github.com/mheers/oc-go-provider-extension)** from the VS Code Marketplace.
+2. Configure your OpenCode Go API key in the extension settings.
+3. Stop the bridge — the extension handles everything natively.
 
 ## How it works
 
